@@ -1,5 +1,5 @@
 from utils import SwiGLU
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -14,36 +14,34 @@ class DeltaNetConfig:
         self,
         hidden_size: int = 2048,
         conv_size: int = 4,
+        conv_bias: bool = False,
         num_heads: int = 16,
         max_position_embeddings: int = 2048,
         hidden_ratio: Optional[int] = 4,
         intermediate_size: Optional[int] = None,
-        hidden_act: str = "swish",
         num_hidden_layers: int = 24,
         norm_eps: float = 1e-6,
         pad_token_id: Optional[int] = None,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
-        tie_word_embeddings: bool = False,
-        initializer_range: float = 0.006,
         vocab_size: int = 32000,
+        is_causal_lm: bool = False,
     ):
         self.hidden_size = hidden_size
         self.conv_size = conv_size
+        self.conv_bias = conv_bias
         self.num_heads = num_heads
         self.max_position_embeddings = max_position_embeddings
 
         self.hidden_ratio = hidden_ratio
         self.intermediate_size = intermediate_size
-        self.hidden_act = hidden_act
         self.num_hidden_layers = num_hidden_layers
         self.norm_eps = norm_eps
-        self.initializer_range = initializer_range
         self.vocab_size = vocab_size
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
-        self.tie_word_embeddings = tie_word_embeddings
+        self.is_causal_lm = is_causal_lm
 
 
 class DeltaNet(nn.Module):
@@ -166,6 +164,7 @@ class DeltaNetBlock(nn.Module):
             hidden_size=config.hidden_size,
             num_heads=config.num_heads,
             conv_size=config.conv_size,
+            conv_bias=config.conv_bias,
             norm_eps=config.norm_eps,
         )
         self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
@@ -204,11 +203,13 @@ class DeltaNetBlock(nn.Module):
         return hidden_states, memory_state
 
 
-class DeltaNetModel:
+class DeltaNetModel(nn.Module):
     def __init__(self, config: DeltaNetConfig):
+        super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.is_causal_lm = config.is_causal_lm
 
         self.embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, self.padding_idx
@@ -218,19 +219,47 @@ class DeltaNetModel:
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
 
-        self.gradient_checkpointing = False
+        if self.is_causal_lm:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.criterion = nn.CrossEntropyLoss()
 
-    def get_input_embeddings(self):
-        return self.embeddings
+    def _process_causal_lm_output(
+        self,
+        hidden_states: torch.Tensor,
+        labels: torch.LongTensor,
+        logits_to_keep: Optional[int] = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Process outputs when the model is used as a causal language model"""
+        logits = self.lm_head(
+            hidden_states
+            if logits_to_keep is None
+            else hidden_states[:, -logits_to_keep:]
+        )
 
-    def set_input_embeddings(self, value):
-        self.embeddings = value
+        labels = labels.to(hidden_states.device)  # pyright: ignore
+        labels = torch.cat(
+            (
+                labels[..., 1:],  # pyright: ignore
+                torch.full_like(labels[:, :1], self.criterion.ignore_index),  # pyright: ignore
+            ),
+            1,
+        )  # pyright: ignore
+
+        loss = self.criterion(logits.view(labels.numel(), -1), labels.view(-1))  # pyright: ignore
+
+        return (loss, logits, hidden_states)
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-    ) -> torch.Tensor:
+        labels: Optional[torch.LongTensor] = None,
+        logits_to_keep: Optional[int] = 0,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, ...],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         assert not (input_ids is not None and inputs_embeds is not None), (
             "You cannot specify both input_ids and inputs_embeds at the same time"
         )
@@ -249,5 +278,15 @@ class DeltaNetModel:
             )
 
         hidden_states = self.norm(hidden_states)
+
+        if self.is_causal_lm and labels is not None:
+            return self._process_causal_lm_output(hidden_states, labels, logits_to_keep)
+        elif self.is_causal_lm:
+            logits = self.lm_head(
+                hidden_states
+                if logits_to_keep is None
+                else hidden_states[:, -logits_to_keep:]
+            )
+            return (logits, hidden_states)
 
         return hidden_states
