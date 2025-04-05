@@ -71,3 +71,28 @@ class DeltaNetBlock(nn.Module):
         output = self.output_proj(output)
 
         return output
+
+
+class DeltaNet(nn.Module):
+    def __init__(
+        self, input_dim, memory_dim, key_dim, value_dim, query_dim, num_layers
+    ):
+        super(DeltaNet, self).__init__()
+        self.input_dim = input_dim
+        self.memory_dim = memory_dim
+        self.key_dim = key_dim
+        self.value_dim = value_dim
+        self.query_dim = query_dim
+        self.num_layers = num_layers
+
+        self.layers = nn.ModuleList(
+            [
+                DeltaNetBlock(input_dim, memory_dim, key_dim, value_dim, query_dim)
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
