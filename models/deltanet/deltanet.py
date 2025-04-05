@@ -1,5 +1,5 @@
 from utils import SwiGLU
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -53,7 +53,6 @@ class DeltaNet(nn.Module):
         num_heads: int = 4,
         conv_size: int = 4,
         conv_bias: bool = False,
-        layer_idx: Optional[int] = None,
         norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
@@ -65,7 +64,6 @@ class DeltaNet(nn.Module):
         self.num_heads = num_heads
         self.conv_size = conv_size
         self.conv_bias = conv_bias
-        self.layer_idx = layer_idx
         self.norm_eps = norm_eps
 
         self.key_dim = hidden_size // num_heads
@@ -121,18 +119,24 @@ class DeltaNet(nn.Module):
     def _delta_rule(
         self,
         k: torch.Tensor,
+        q: torch.Tensor,
         v: torch.Tensor,
         beta: torch.Tensor,
         last_state: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         last_state = (
             last_state
             if last_state is not None
             else torch.zeros((self.hidden_size, self.hidden_size))
         )
-        return last_state - beta * (last_state @ k - v) @ k.T
+        hidden_state = last_state - beta * (last_state @ k - v) @ k.T
+        o = hidden_state @ q
 
-    def forward(self, x: torch.Tensor, last_state: Optional[torch.Tensor] = None):
+        return o, hidden_state
+
+    def forward(
+        self, x: torch.Tensor, last_state: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         k, q, v = self.k_proj(x), self.q_proj(x), self.v_proj(x)
 
         k = self._calculate_conv(k, self.k_conv)
@@ -144,19 +148,18 @@ class DeltaNet(nn.Module):
 
         beta = self._calculate_beta(x)
 
-        delta = self._delta_rule(k, v, beta, last_state)
-        output = self.output_norm(delta)
-        output = self.output_proj(output)
+        o, memory_state = self._delta_rule(k, q, v, beta, last_state)
+        o = self.output_norm(o)
+        o = self.output_proj(o)
 
-        return output
+        return o, memory_state
 
 
 class DeltaNetBlock(nn.Module):
-    def __init__(self, config: DeltaNetConfig, layer_idx: int):
+    def __init__(self, config: DeltaNetConfig):
         super().__init__()
 
         self.config = config
-        self.layer_idx = layer_idx
 
         self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.attn = DeltaNet(
@@ -164,7 +167,6 @@ class DeltaNetBlock(nn.Module):
             num_heads=config.num_heads,
             conv_size=config.conv_size,
             norm_eps=config.norm_eps,
-            layer_idx=layer_idx,
         )
         self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
 
@@ -184,20 +186,11 @@ class DeltaNetBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[torch.FloatTensor]]]:
+        last_memory_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
-        hidden_states, attentions, past_key_values = self.attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-        )
+        hidden_states, memory_state = self.attn(hidden_states, last_memory_state)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.mlp_norm(hidden_states)
@@ -208,9 +201,7 @@ class DeltaNetBlock(nn.Module):
 
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, attentions, past_key_values)
-
-        return outputs
+        return hidden_states, memory_state
 
 
 class DeltaNetModel:
@@ -223,10 +214,7 @@ class DeltaNetModel:
             config.vocab_size, config.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(
-            [
-                DeltaNetBlock(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            [DeltaNetBlock(config) for _ in range(config.num_hidden_layers)]
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
 
@@ -241,12 +229,8 @@ class DeltaNetModel:
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-    ) -> Tuple:
+    ) -> torch.Tensor:
         assert not (input_ids is not None and inputs_embeds is not None), (
             "You cannot specify both input_ids and inputs_embeds at the same time"
         )
@@ -257,16 +241,13 @@ class DeltaNetModel:
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
         hidden_states = inputs_embeds
+        memory_state = None
 
         for layer in self.layers:
-            hidden_states, attentions, past_key_values = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
+            hidden_states, memory_state = layer(
+                hidden_states, last_memory_state=memory_state
             )
 
         hidden_states = self.norm(hidden_states)
 
-        return tuple(i for i in [hidden_states, past_key_values] if i is not None)
+        return hidden_states
