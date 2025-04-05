@@ -1,9 +1,20 @@
+from typing import Optional
+from utils import SwiGLU
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class DeltaNetBlock(nn.Module):
-    def __init__(self, input_dim, memory_dim, key_dim, value_dim, query_dim):
+    def __init__(
+        self,
+        input_dim: int,
+        memory_dim: int,
+        key_dim: int,
+        value_dim: int,
+        query_dim: int,
+    ) -> None:
         super(DeltaNetBlock, self).__init__()
         self.input_dim = input_dim
         self.memory_dim = memory_dim
@@ -28,25 +39,36 @@ class DeltaNetBlock(nn.Module):
 
         return k_proj, q_proj, v_proj
 
-    def _build_convolutional_layers(self):  # TODO: 1d or 2d ?
-        k_conv = nn.Conv2d(self.key_dim, self.memory_dim, kernel_size=3, padding=1)
-        q_conv = nn.Conv2d(self.query_dim, self.memory_dim, kernel_size=3, padding=1)
-        v_conv = nn.Conv2d(self.value_dim, self.memory_dim, kernel_size=3, padding=1)
+    def _build_convolutional_layers(self):
+        k_conv = nn.Conv1d(self.key_dim, self.memory_dim, kernel_size=3, padding=1)
+        q_conv = nn.Conv1d(self.query_dim, self.memory_dim, kernel_size=3, padding=1)
+        v_conv = nn.Conv1d(self.value_dim, self.memory_dim, kernel_size=3, padding=1)
 
         return k_conv, q_conv, v_conv
 
-    def _normalize(self, x):  # apply L2 normalization
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:  # apply L2 normalization
         return F.normalize(x, p=2, dim=-1)
 
-    def _calculate_beta(self, x):
+    def _calculate_beta(self, x: torch.Tensor) -> torch.Tensor:
         x = self.beta_proj(x)
         x = self.beta_activation(x)
         return x
 
-    def _delta_rule(self, k, q, v, beta):
-        pass
+    def _delta_rule(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        beta: torch.Tensor,
+        last_state: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        last_state = (
+            last_state
+            if last_state is not None
+            else torch.zeros((self.memory_dim, self.memory_dim))
+        )
+        return last_state - beta * (last_state @ k - v) @ k.T
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, last_state: Optional[torch.Tensor] = None):
         batch_size, _, seq_len = x.size()  # (batch_size, input_dim, seq_len)
 
         k, q, v = self.k_proj(x), self.q_proj(x), self.v_proj(x)
@@ -66,7 +88,7 @@ class DeltaNetBlock(nn.Module):
 
         beta = self._calculate_beta(x)
 
-        delta = self._delta_rule(k, q, v, beta)
+        delta = self._delta_rule(k, v, beta, last_state)
         output = self.output_norm(delta)
         output = self.output_proj(output)
 
