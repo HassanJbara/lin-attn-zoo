@@ -4,8 +4,8 @@ from models.deltanet import DeltaNetConfig, DeltaNetModel
 
 
 @pytest.fixture
-def model_config():
-    """Create a test configuration for DeltaNet."""
+def chunk_model_config():
+    """Create a test configuration for DeltaNet in chunk mode."""
     return DeltaNetConfig(
         vocab_size=10000,
         hidden_size=128,
@@ -13,73 +13,129 @@ def model_config():
         num_heads=4,
         conv_size=3,
         norm_eps=1e-5,
+        mode="chunk",
+        chunk_size=4,
     )
 
 
 @pytest.fixture
-def model(model_config):
-    """Create a DeltaNet model for testing."""
-    model = DeltaNetModel(model_config)
+def recurrent_model_config():
+    """Create a test configuration for DeltaNet in recurrent mode."""
+    return DeltaNetConfig(
+        vocab_size=10000,
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_heads=4,
+        conv_size=3,
+        norm_eps=1e-5,
+        mode="recurrent",
+    )
+
+
+@pytest.fixture
+def chunk_model(chunk_model_config):
+    """Create a DeltaNet model in chunk mode for testing."""
+    model = DeltaNetModel(chunk_model_config)
     model.eval()
     return model
 
 
 @pytest.fixture
-def test_inputs(model_config):
+def recurrent_model(recurrent_model_config):
+    """Create a DeltaNet model in recurrent mode for testing."""
+    model = DeltaNetModel(recurrent_model_config)
+    model.eval()
+    return model
+
+
+@pytest.fixture
+def test_inputs():
     """Create test input tensors."""
     batch_size = 2
     seq_length = 10
+    vocab_size = 10000
     return {
         "batch_size": batch_size,
         "seq_length": seq_length,
-        "input_ids": torch.randint(
-            0, model_config.vocab_size, (batch_size, seq_length)
-        ),
+        "input_ids": torch.randint(0, vocab_size, (batch_size, seq_length)),
     }
 
 
-def test_forward_no_memory(model, test_inputs, model_config):
-    """Test forward pass without providing memory states."""
+def test_forward_no_memory(chunk_model, test_inputs, chunk_model_config):
+    """Test forward pass without providing memory states for chunk mode."""
     with torch.no_grad():
-        logits, hidden_states, memory_states = model(input_ids=test_inputs["input_ids"])
+        logits, hidden_states, memory_states = chunk_model(
+            input_ids=test_inputs["input_ids"]
+        )
 
     # Check shapes
     assert logits.shape == (
         test_inputs["batch_size"],
         test_inputs["seq_length"],
-        model_config.vocab_size,
+        chunk_model_config.vocab_size,
     )
     assert hidden_states.shape == (
         test_inputs["batch_size"],
         test_inputs["seq_length"],
-        model_config.hidden_size,
+        chunk_model_config.hidden_size,
     )
-    assert len(memory_states) == model_config.num_hidden_layers
+    assert len(memory_states) == chunk_model_config.num_hidden_layers
 
     # Check memory state shapes
-    head_dim = model_config.hidden_size // model_config.num_heads
+    head_dim = chunk_model_config.hidden_size // chunk_model_config.num_heads
     for state in memory_states:
         assert state.shape == (
             test_inputs["batch_size"],
-            model_config.num_heads,
+            chunk_model_config.num_heads,
             head_dim,
             head_dim,
         )
 
 
-def test_forward_with_memory(model, test_inputs, model_config):
-    """Test forward pass with provided memory states."""
+def test_forward_recurrent_mode(recurrent_model, test_inputs, recurrent_model_config):
+    """Test forward pass in recurrent mode."""
+    with torch.no_grad():
+        logits, hidden_states, memory_states = recurrent_model(
+            input_ids=test_inputs["input_ids"]
+        )
+
+    # Check shapes
+    assert logits.shape == (
+        test_inputs["batch_size"],
+        test_inputs["seq_length"],
+        recurrent_model_config.vocab_size,
+    )
+    assert hidden_states.shape == (
+        test_inputs["batch_size"],
+        test_inputs["seq_length"],
+        recurrent_model_config.hidden_size,
+    )
+    assert len(memory_states) == recurrent_model_config.num_hidden_layers
+
+    # Check memory state shapes
+    head_dim = recurrent_model_config.hidden_size // recurrent_model_config.num_heads
+    for state in memory_states:
+        assert state.shape == (
+            test_inputs["batch_size"],
+            recurrent_model_config.num_heads,
+            head_dim,
+            head_dim,
+        )
+
+
+def test_forward_with_memory_chunk_mode(chunk_model, test_inputs, chunk_model_config):
+    """Test forward pass with provided memory states in chunk mode."""
     # Create initial memory states
     batch_size = test_inputs["batch_size"]
-    head_dim = model_config.hidden_size // model_config.num_heads
+    head_dim = chunk_model_config.hidden_size // chunk_model_config.num_heads
 
     memory_states = [
-        torch.zeros((batch_size, model_config.num_heads, head_dim, head_dim))
-        for _ in range(model_config.num_hidden_layers)
+        torch.zeros((batch_size, chunk_model_config.num_heads, head_dim, head_dim))
+        for _ in range(chunk_model_config.num_hidden_layers)
     ]
 
     with torch.no_grad():
-        logits, hidden_states, updated_memory_states = model(
+        logits, hidden_states, updated_memory_states = chunk_model(
             input_ids=test_inputs["input_ids"], memory_states=memory_states
         )
 
@@ -87,22 +143,60 @@ def test_forward_with_memory(model, test_inputs, model_config):
     assert logits.shape == (
         batch_size,
         test_inputs["seq_length"],
-        model_config.vocab_size,
+        chunk_model_config.vocab_size,
     )
     assert hidden_states.shape == (
         batch_size,
         test_inputs["seq_length"],
-        model_config.hidden_size,
+        chunk_model_config.hidden_size,
     )
-    assert len(updated_memory_states) == model_config.num_hidden_layers
+    assert len(updated_memory_states) == chunk_model_config.num_hidden_layers
 
     # Verify memory states were updated (should not be all zeros anymore)
     for state in updated_memory_states:
         assert not torch.allclose(state, torch.zeros_like(state))
 
 
-def test_autoregressive_generation(model, test_inputs, model_config):
-    """Test autoregressive token generation."""
+def test_forward_with_memory_recurrent_mode(
+    recurrent_model, test_inputs, recurrent_model_config
+):
+    """Test forward pass with provided memory states in recurrent mode."""
+    # Create initial memory states
+    batch_size = test_inputs["batch_size"]
+    head_dim = recurrent_model_config.hidden_size // recurrent_model_config.num_heads
+
+    memory_states = [
+        torch.zeros((batch_size, recurrent_model_config.num_heads, head_dim, head_dim))
+        for _ in range(recurrent_model_config.num_hidden_layers)
+    ]
+
+    with torch.no_grad():
+        logits, hidden_states, updated_memory_states = recurrent_model(
+            input_ids=test_inputs["input_ids"], memory_states=memory_states
+        )
+
+    # Check shapes
+    assert logits.shape == (
+        batch_size,
+        test_inputs["seq_length"],
+        recurrent_model_config.vocab_size,
+    )
+    assert hidden_states.shape == (
+        batch_size,
+        test_inputs["seq_length"],
+        recurrent_model_config.hidden_size,
+    )
+    assert len(updated_memory_states) == recurrent_model_config.num_hidden_layers
+
+    # Verify memory states were updated (should not be all zeros anymore)
+    for state in updated_memory_states:
+        assert not torch.allclose(state, torch.zeros_like(state))
+
+
+def test_autoregressive_generation_chunk_mode(
+    chunk_model, test_inputs, chunk_model_config
+):
+    """Test autoregressive token generation in chunk mode."""
     batch_size = test_inputs["batch_size"]
 
     # Start with first token only
@@ -115,12 +209,12 @@ def test_autoregressive_generation(model, test_inputs, model_config):
     # Generate 5 tokens
     for _ in range(5):
         with torch.no_grad():
-            logits, _, memory_states = model(
+            logits, _, memory_states = chunk_model(
                 input_ids=current_input, memory_states=memory_states
             )
 
             # Verify logits shape for single token prediction
-            assert logits.shape == (batch_size, 1, model_config.vocab_size)
+            assert logits.shape == (batch_size, 1, chunk_model_config.vocab_size)
 
             # Get next token predictions
             next_tokens = torch.argmax(logits[:, -1], dim=-1, keepdim=True)
@@ -136,4 +230,63 @@ def test_autoregressive_generation(model, test_inputs, model_config):
     # Verify all tokens are within vocabulary range
     for tokens in generated_tokens:
         assert (tokens >= 0).all()
-        assert (tokens < model_config.vocab_size).all()
+        assert (tokens < chunk_model_config.vocab_size).all()
+
+
+def test_autoregressive_generation_recurrent_mode(
+    recurrent_model, test_inputs, recurrent_model_config
+):
+    """Test autoregressive token generation in recurrent mode."""
+    batch_size = test_inputs["batch_size"]
+
+    # Start with first token only
+    current_input = test_inputs["input_ids"][:, 0:1]
+    memory_states = None
+
+    # Track generated tokens
+    generated_tokens = []
+
+    # Generate 5 tokens
+    for _ in range(5):
+        with torch.no_grad():
+            logits, _, memory_states = recurrent_model(
+                input_ids=current_input, memory_states=memory_states
+            )
+
+            # Verify logits shape for single token prediction
+            assert logits.shape == (batch_size, 1, recurrent_model_config.vocab_size)
+
+            # Get next token predictions
+            next_tokens = torch.argmax(logits[:, -1], dim=-1, keepdim=True)
+            assert next_tokens.shape == (batch_size, 1)
+
+            # Use as next input
+            current_input = next_tokens
+            generated_tokens.append(next_tokens)
+
+    # Verify we generated 5 tokens for each sequence
+    assert len(generated_tokens) == 5
+
+    # Verify all tokens are within vocabulary range
+    for tokens in generated_tokens:
+        assert (tokens >= 0).all()
+        assert (tokens < recurrent_model_config.vocab_size).all()
+
+
+def test_compare_modes_output_shapes(chunk_model, recurrent_model, test_inputs):
+    """Test that both modes produce outputs with the same shapes."""
+    with torch.no_grad():
+        chunk_logits, chunk_hidden, chunk_memory = chunk_model(
+            input_ids=test_inputs["input_ids"]
+        )
+        recurrent_logits, recurrent_hidden, recurrent_memory = recurrent_model(
+            input_ids=test_inputs["input_ids"]
+        )
+
+    # Compare shapes
+    assert chunk_logits.shape == recurrent_logits.shape
+    assert chunk_hidden.shape == recurrent_hidden.shape
+    assert len(chunk_memory) == len(recurrent_memory)
+
+    for chunk_state, recurrent_state in zip(chunk_memory, recurrent_memory):
+        assert chunk_state.shape == recurrent_state.shape
