@@ -173,16 +173,16 @@ class DeltaNet(nn.Module):
 
         T = torch.zeros(B, num_chunks, C, C, device=Q.device)
         for h in range(H):
-            T -= (
+            T = T - (
                 K_beta_reshaped[..., h] @ K_transposed[..., h].transpose(-1, -2)
             ).tril(-1)
 
-        T += torch.eye(C, device=Q.device)
+        T = T + torch.eye(C, device=Q.device)
 
         for i in range(1, C):
-            T[:, :, i, :i] = T[:, :, i, :i] + (
-                T[:, :, i, :, None] * T[:, :, :, :i]
-            ).sum(-2)
+            t_slice = T[:, :, i, :i] + (T[:, :, i, :, None] * T[:, :, :, :i]).sum(-2)
+            T = T.clone()  # Avoid in-place operation
+            T[:, :, i, :i] = t_slice
 
         W = torch.zeros_like(K_beta)  # [B, num_chunks, C, H, D]
         U = torch.zeros_like(V_beta)  # [B, num_chunks, C, H, D]
@@ -208,9 +208,7 @@ class DeltaNet(nn.Module):
             o_inter = torch.einsum("bchd,bhdd->bchd", q_i, S)  # [B, C, H, D]
             A_i = torch.einsum("bchd,bchd->bc", q_i, k_i).tril()  # [B, C, C]
             o_intra = torch.einsum("bc,bchd->bchd", A_i, u_i)  # [B, C, H, D]
-            S += torch.einsum(
-                "bcdh,bche->bhde", k_i.transpose(-1, -2), u_i
-            )  # [B, H, D, D]
+            S = S + torch.einsum("bcdh,bche->bhde", k_i.transpose(-1, -2), u_i)
             O[:, i] = o_inter + o_intra
 
         if padding > 0:
@@ -304,7 +302,7 @@ class DeltaNetBlock(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         attn_output = self.attn_norm(hidden_states)
         attn_output, memory_state = self.attn(
-            hidden_states, last_memory_state
+            attn_output, last_memory_state
         )  # [B, L, D]
 
         hidden_states = hidden_states + attn_output

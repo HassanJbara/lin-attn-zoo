@@ -40,6 +40,13 @@ def parse_args():
     )
     parser.add_argument("--num_layers", type=int, default=4, help="Number of layers")
     parser.add_argument(
+        "--mode",
+        type=str,
+        default="chunk",
+        choices=["chunk", "recurrent"],
+        help="Mode of delta rule calculation (chunk or recurrent)",
+    )
+    parser.add_argument(
         "--wandb_project",
         type=str,
         default="deltanet",
@@ -96,7 +103,7 @@ def main():
     if use_wandb:
         wandb_run_name = (
             args.wandb_run_name
-            or f"deltanet-h{args.hidden_size}-l{args.num_layers}-heads{args.num_heads}"
+            or f"deltanet_{args.mode}-h{args.hidden_size}-l{args.num_layers}-heads{args.num_heads}"
         )
         wandb.init(
             project=args.wandb_project,
@@ -140,10 +147,7 @@ def main():
         vocab_size=len(tokenizer),
         max_position_embeddings=args.seq_length,
         pad_token_id=tokenizer.pad_token_id,
-        bos_token_id=tokenizer.bos_token_id
-        if hasattr(tokenizer, "bos_token_id")
-        else tokenizer.cls_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        mode=args.mode,
     )
 
     model = DeltaNetModel(config)

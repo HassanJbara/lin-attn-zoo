@@ -290,3 +290,49 @@ def test_compare_modes_output_shapes(chunk_model, recurrent_model, test_inputs):
 
     for chunk_state, recurrent_state in zip(chunk_memory, recurrent_memory):
         assert chunk_state.shape == recurrent_state.shape
+
+
+def test_backpropagation_chunk_mode(chunk_model, test_inputs, chunk_model_config):
+    """Test backpropagation in chunk mode."""
+    # Switch to training mode
+    chunk_model.train()
+    optimizer = torch.optim.Adam(chunk_model.parameters(), lr=0.001)
+    input_ids = test_inputs["input_ids"]
+    target_ids = torch.randint(0, chunk_model_config.vocab_size, input_ids.shape)
+    optimizer.zero_grad()
+
+    loss, _, _ = chunk_model(input_ids=input_ids, labels=target_ids)
+    assert not torch.isnan(loss).any()
+
+    loss.backward()
+    for name, param in chunk_model.named_parameters():
+        if param.requires_grad:
+            assert param.grad is not None, f"No gradient for {name} in chunk mode"
+            assert not torch.isnan(param.grad).any(), (
+                f"NaN gradient for {name} in chunk mode"
+            )
+    optimizer.step()
+
+
+def test_backpropagation_recurrent_mode(
+    recurrent_model, test_inputs, recurrent_model_config
+):
+    """Test backpropagation in recurrent mode."""
+    # Switch to training mode
+    recurrent_model.train()
+    optimizer = torch.optim.Adam(recurrent_model.parameters(), lr=0.001)
+    input_ids = test_inputs["input_ids"]
+    target_ids = torch.randint(0, recurrent_model_config.vocab_size, input_ids.shape)
+    optimizer.zero_grad()
+
+    loss, _, _ = recurrent_model(input_ids=input_ids, labels=target_ids)
+    assert not torch.isnan(loss).any()
+
+    loss.backward()
+    for name, param in recurrent_model.named_parameters():
+        if param.requires_grad:
+            assert param.grad is not None, f"No gradient for {name} in recurrent mode"
+            assert not torch.isnan(param.grad).any(), (
+                f"NaN gradient for {name} in recurrent mode"
+            )
+    optimizer.step()
