@@ -100,17 +100,16 @@ class DeltaNet(nn.Module):
 
     def _calculate_conv(
         self,
-        x: torch.Tensor,  # [B, T, D]
+        x: torch.Tensor,  # [B, L, D]
         conv_layer: nn.Conv1d,
     ):
-        # Reshape to apply convolution across the sequence dimension, treat features as channels
-        x = x.transpose(1, 2)  # [B, T, D] --> [B, D, T]
+        # reshape to apply convolution across the sequence dimension, treat features as channels
+        x = x.transpose(1, 2)  # [B, L, D] --> [B, D, L]
 
-        # Apply convolution and trim
         x = conv_layer(x)[..., : x.size(-1)]
         x = self.activation(x)
 
-        return x.transpose(1, 2)  # [B, D, T] --> [B, T, D]
+        return x.transpose(1, 2)  # [B, D, L] --> [B, L, D]
 
     def _delta_rule(
         self,
@@ -195,7 +194,6 @@ class DeltaNetBlock(nn.Module):
             intermediate_size = int(config.hidden_size * hidden_ratio * 2 / 3)
             intermediate_size = 256 * ((intermediate_size + 256 - 1) // 256)
 
-        # Set up MLP projections
         self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
@@ -206,7 +204,7 @@ class DeltaNetBlock(nn.Module):
         hidden_states: torch.Tensor,
         last_memory_state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        residual = hidden_states  # [B, T, D]
+        residual = hidden_states  # [B, L, D]
 
         normalized = self.attn_norm(hidden_states)
         attn_output, memory_state = self.attn(normalized, last_memory_state)  # [B, D]
@@ -216,13 +214,13 @@ class DeltaNetBlock(nn.Module):
         updated_residual[:, -1, :] = residual[:, -1, :] + attn_output
 
         # Apply MLP only to the last token
-        last_token = updated_residual[:, -1:, :]  # Shape: [B, 1, D]
+        last_token = updated_residual[:, -1:, :]  # [B, 1, D]
         normalized_last = self.mlp_norm(last_token)
         gate, y = (
             self.gate_proj(normalized_last),
             self.up_proj(normalized_last),
         )  # TODO: how is gate used?
-        mlp_output = self.down_proj(self.swiglu(y))  # Shape: [B, 1, D]
+        mlp_output = self.down_proj(self.swiglu(y))  # [B, 1, D]
 
         final_output = updated_residual.clone()
         final_output[:, -1:, :] = last_token + mlp_output
@@ -296,16 +294,14 @@ class DeltaNetModel(nn.Module):
             inputs_embeds = self.embeddings(input_ids)
         hidden_states = inputs_embeds
 
-        # Initialize memory states if None
         if memory_states is None:
             memory_states = [None for _ in self.layers]
 
-        # Ensure we have the right number of memory states
         assert len(memory_states) == len(self.layers), (
             f"Expected {len(self.layers)} memory states, got {len(memory_states)}"
         )
 
-        # Process through each layer with its own memory state
+        # process through each layer with its own memory state
         for i, layer in enumerate(self.layers):
             hidden_states, memory_states[i] = layer(hidden_states, memory_states[i])
 
