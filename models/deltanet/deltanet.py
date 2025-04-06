@@ -1,5 +1,5 @@
-from utils import SwiGLU
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
+from models.utils import SwiGLU
 
 import torch
 import torch.nn as nn
@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 class DeltaNetConfig:
     model_type = "delta_net"
-    keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
@@ -25,7 +24,6 @@ class DeltaNetConfig:
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         vocab_size: int = 32000,
-        is_causal_lm: bool = False,
     ):
         self.hidden_size = hidden_size
         self.conv_size = conv_size
@@ -41,7 +39,6 @@ class DeltaNetConfig:
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
-        self.is_causal_lm = is_causal_lm
 
 
 class DeltaNet(nn.Module):
@@ -67,11 +64,15 @@ class DeltaNet(nn.Module):
         self.key_dim = hidden_size // num_heads
         self.value_dim = hidden_size // num_heads
 
-        self.k_proj, self.q_proj, self.v_proj = self._build_projection_layers()
+        self.k_proj, self.q_proj, self.v_proj = (
+            nn.Linear(self.hidden_size, self.hidden_size, bias=False),
+            nn.Linear(self.hidden_size, self.hidden_size, bias=False),
+            nn.Linear(self.hidden_size, self.hidden_size, bias=False),
+        )
         self.k_conv, self.q_conv, self.v_conv = (
-            self._build_conv(self.key_dim),
-            self._build_conv(self.key_dim),
-            self._build_conv(self.value_dim),
+            self._build_conv(),
+            self._build_conv(),
+            self._build_conv(),
         )
         self.kq_norm = lambda x: F.normalize(x, p=2, dim=-1)  # l2 normalization
         self.activation = nn.SiLU()
@@ -82,19 +83,12 @@ class DeltaNet(nn.Module):
         self.output_norm = nn.RMSNorm(self.hidden_size, eps=self.norm_eps)
         self.output_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
-    def _build_projection_layers(self):
-        k_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
-        q_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
-        v_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-
-        return k_proj, q_proj, v_proj
-
-    def _build_conv(self, grouping_dim: int):
+    def _build_conv(self):
         return nn.Conv1d(
-            in_channels=grouping_dim,
-            out_channels=grouping_dim,
+            in_channels=self.hidden_size,
+            out_channels=self.hidden_size,
             kernel_size=self.conv_size,
-            groups=grouping_dim,
+            groups=self.hidden_size,
             padding=self.conv_size - 1,
             bias=self.conv_bias,
         )
@@ -104,7 +98,11 @@ class DeltaNet(nn.Module):
         x = self.beta_activation(x)
         return x
 
-    def _calculate_conv(self, x: torch.Tensor, conv_layer: nn.Conv1d):
+    def _calculate_conv(
+        self,
+        x: torch.Tensor,  # [B, T, D]
+        conv_layer: nn.Conv1d,
+    ):
         # Reshape to apply convolution across the sequence dimension, treat features as channels
         x = x.transpose(1, 2)  # [B, T, D] --> [B, D, T]
 
@@ -116,41 +114,62 @@ class DeltaNet(nn.Module):
 
     def _delta_rule(
         self,
-        k: torch.Tensor,
-        q: torch.Tensor,
-        v: torch.Tensor,
-        beta: torch.Tensor,
-        last_state: Optional[torch.Tensor] = None,
+        k: torch.Tensor,  # [B, H, D]
+        q: torch.Tensor,  # [B, H, D]
+        v: torch.Tensor,  # [B, H, D]
+        beta: torch.Tensor,  # [B, H, 1]
+        last_state: torch.Tensor,  # [B, H, D, D]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        last_state = (
-            last_state
-            if last_state is not None
-            else torch.zeros((self.hidden_size, self.hidden_size))
-        )
-        hidden_state = last_state - beta * (last_state @ k - v) @ k.T
-        o = hidden_state @ q
+        k_unsqueezed = k.unsqueeze(-1)  # [B, H, D, 1]
+        v_unsqueezed = v.unsqueeze(-1)  # [B, H, D, 1]
+
+        update = (last_state @ k_unsqueezed - v_unsqueezed) @ k_unsqueezed.transpose(
+            -1, -2
+        )  # [B, H, D, D]
+        hidden_state = last_state - beta.unsqueeze(-1) * update
+        o = hidden_state @ q.unsqueeze(-1)  # [B, H, D, 1]
+        o = o.squeeze(-1)  # [B, H, D]
 
         return o, hidden_state
 
     def forward(
         self, x: torch.Tensor, last_state: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        k, q, v = self.k_proj(x), self.q_proj(x), self.v_proj(x)
+        B, L, D = x.size()  # x: [B, L, D]
+        head_dim = self.key_dim
 
-        k = self._calculate_conv(k, self.k_conv)
-        q = self._calculate_conv(q, self.q_conv)
-        v = self._calculate_conv(v, self.v_conv)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        k = self._calculate_conv(k, self.k_conv).reshape(B, L, self.num_heads, head_dim)
+        q = self._calculate_conv(q, self.q_conv).reshape(B, L, self.num_heads, head_dim)
+        v = self._calculate_conv(v, self.v_conv).reshape(B, L, self.num_heads, head_dim)
 
         k, q, v = self.activation(k), self.activation(q), self.activation(v)
         k, q = self.kq_norm(k), self.kq_norm(q)
 
-        beta = self._calculate_beta(x)
+        beta = self._calculate_beta(x).reshape(B, L, self.num_heads, 1)
+        last_state = (
+            last_state
+            if last_state is not None
+            else torch.zeros((B, self.num_heads, head_dim, head_dim), device=x.device)
+        )
+        o_t = torch.zeros((B, self.num_heads, head_dim), device=x.device)
 
-        o, memory_state = self._delta_rule(k, q, v, beta, last_state)
+        for t in range(L):
+            beta_t = beta[:, t]
+            k_t = k[:, t]
+            q_t = q[:, t]
+            v_t = v[:, t]
+
+            o_t, last_state = self._delta_rule(k_t, q_t, v_t, beta_t, last_state)
+
+        o = o_t.reshape(B, self.num_heads * head_dim)  # [B, H, D] --> [B, H*D]
         o = self.output_norm(o)
         o = self.output_proj(o)
 
-        return o, memory_state
+        return o, last_state
 
 
 class DeltaNetBlock(nn.Module):
@@ -180,27 +199,35 @@ class DeltaNetBlock(nn.Module):
         self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
-        self.swiglu = SwiGLU(intermediate_size, config.hidden_size)
+        self.swiglu = SwiGLU(intermediate_size, intermediate_size)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         last_memory_state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        residual = hidden_states
-        hidden_states = self.attn_norm(hidden_states)
-        hidden_states, memory_state = self.attn(hidden_states, last_memory_state)
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.mlp_norm(hidden_states)
+        residual = hidden_states  # [B, T, D]
 
-        # Apply the MLP
-        gate, y = self.gate_proj(hidden_states), self.up_proj(hidden_states)
-        hidden_states = self.down_proj(self.swiglu(gate, y))
+        normalized = self.attn_norm(hidden_states)
+        attn_output, memory_state = self.attn(normalized, last_memory_state)  # [B, D]
 
-        hidden_states = residual + hidden_states
+        # Update only the last token in residual
+        updated_residual = residual.clone()
+        updated_residual[:, -1, :] = residual[:, -1, :] + attn_output
 
-        return hidden_states, memory_state
+        # Apply MLP only to the last token
+        last_token = updated_residual[:, -1:, :]  # Shape: [B, 1, D]
+        normalized_last = self.mlp_norm(last_token)
+        gate, y = (
+            self.gate_proj(normalized_last),
+            self.up_proj(normalized_last),
+        )  # TODO: how is gate used?
+        mlp_output = self.down_proj(self.swiglu(y))  # Shape: [B, 1, D]
+
+        final_output = updated_residual.clone()
+        final_output[:, -1:, :] = last_token + mlp_output
+
+        return final_output, memory_state
 
 
 class DeltaNetModel(nn.Module):
@@ -209,7 +236,6 @@ class DeltaNetModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.is_causal_lm = config.is_causal_lm
 
         self.embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, self.padding_idx
@@ -219,9 +245,8 @@ class DeltaNetModel(nn.Module):
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
 
-        if self.is_causal_lm:
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-            self.criterion = nn.CrossEntropyLoss()
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.criterion = nn.CrossEntropyLoss()
 
     def _process_causal_lm_output(
         self,
@@ -239,13 +264,13 @@ class DeltaNetModel(nn.Module):
         labels = labels.to(hidden_states.device)  # pyright: ignore
         labels = torch.cat(
             (
-                labels[..., 1:],  # pyright: ignore
-                torch.full_like(labels[:, :1], self.criterion.ignore_index),  # pyright: ignore
+                labels[..., 1:],
+                torch.full_like(labels[:, :1], self.criterion.ignore_index),
             ),
             1,
         )  # pyright: ignore
 
-        loss = self.criterion(logits.view(labels.numel(), -1), labels.view(-1))  # pyright: ignore
+        loss = self.criterion(logits.view(labels.numel(), -1), labels.view(-1))
 
         return (loss, logits, hidden_states)
 
@@ -255,10 +280,10 @@ class DeltaNetModel(nn.Module):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         logits_to_keep: Optional[int] = 0,
+        memory_states: Optional[List[Union[torch.Tensor, None]]] = None,
     ) -> Union[
-        torch.Tensor,
         Tuple[torch.Tensor, ...],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, List[Union[torch.Tensor, None]]],
     ]:
         assert not (input_ids is not None and inputs_embeds is not None), (
             "You cannot specify both input_ids and inputs_embeds at the same time"
@@ -270,23 +295,28 @@ class DeltaNetModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
         hidden_states = inputs_embeds
-        memory_state = None
 
-        for layer in self.layers:
-            hidden_states, memory_state = layer(
-                hidden_states, last_memory_state=memory_state
-            )
+        # Initialize memory states if None
+        if memory_states is None:
+            memory_states = [None for _ in self.layers]
+
+        # Ensure we have the right number of memory states
+        assert len(memory_states) == len(self.layers), (
+            f"Expected {len(self.layers)} memory states, got {len(memory_states)}"
+        )
+
+        # Process through each layer with its own memory state
+        for i, layer in enumerate(self.layers):
+            hidden_states, memory_states[i] = layer(hidden_states, memory_states[i])
 
         hidden_states = self.norm(hidden_states)
 
-        if self.is_causal_lm and labels is not None:
+        if labels is not None:
             return self._process_causal_lm_output(hidden_states, labels, logits_to_keep)
-        elif self.is_causal_lm:
-            logits = self.lm_head(
-                hidden_states
-                if logits_to_keep is None
-                else hidden_states[:, -logits_to_keep:]
-            )
-            return (logits, hidden_states)
 
-        return hidden_states
+        logits = self.lm_head(
+            hidden_states
+            if logits_to_keep is None
+            else hidden_states[:, -logits_to_keep:]
+        )
+        return (logits, hidden_states, memory_states)

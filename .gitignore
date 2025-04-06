@@ -1,2 +1,7 @@
 .python-version
 venv
+.pytest_cache
+__pycache__
+*.ipynb
+.vscode/
+.DS_Store
