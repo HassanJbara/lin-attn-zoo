@@ -11,7 +11,7 @@ import wandb
 
 # Add parent directory to path for importing models
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from models.deltanet.deltanet import DeltaNetConfig, DeltaNetModel
+from models.deltanet import DeltaNetConfig, DeltaNetModel
 
 
 def count_parameters(model):

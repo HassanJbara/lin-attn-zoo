@@ -1,6 +1,6 @@
 import pytest
 import torch
-from models.deltanet.deltanet import DeltaNetConfig, DeltaNetModel
+from models.deltanet import DeltaNetConfig, DeltaNetModel
 
 
 @pytest.fixture

@@ -1,3 +1,4 @@
+from math import ceil
 from typing import List, Optional, Tuple, Union
 from models.utils import SwiGLU
 
@@ -21,9 +22,9 @@ class DeltaNetConfig:
         num_hidden_layers: int = 24,
         norm_eps: float = 1e-6,
         pad_token_id: Optional[int] = None,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
         vocab_size: int = 32000,
+        mode: str = "chunk",
+        chunk_size: int = 64,
     ):
         self.hidden_size = hidden_size
         self.conv_size = conv_size
@@ -37,8 +38,8 @@ class DeltaNetConfig:
         self.norm_eps = norm_eps
         self.vocab_size = vocab_size
         self.pad_token_id = pad_token_id
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
+        self.mode = mode
+        self.chunk_size = chunk_size
 
 
 class DeltaNet(nn.Module):
@@ -49,10 +50,15 @@ class DeltaNet(nn.Module):
         conv_size: int = 4,
         conv_bias: bool = False,
         norm_eps: float = 1e-5,
+        mode: str = "chunk",
+        chunk_size: int = 64,
     ) -> None:
         super().__init__()
         assert hidden_size % num_heads == 0, (
             "hidden_size must be divisible by num_heads"
+        )
+        assert mode in ["chunk", "recurrent"], (
+            "mode must be either 'chunk' or 'recurrent'"
         )
 
         self.hidden_size = hidden_size
@@ -60,6 +66,8 @@ class DeltaNet(nn.Module):
         self.conv_size = conv_size
         self.conv_bias = conv_bias
         self.norm_eps = norm_eps
+        self.mode = mode
+        self.chunk_size = chunk_size
 
         self.key_dim = hidden_size // num_heads
         self.value_dim = hidden_size // num_heads
@@ -131,6 +139,85 @@ class DeltaNet(nn.Module):
 
         return o, hidden_state
 
+    def _chunk_delta_rule(
+        self,
+        Q,  # [B, L, H, D]
+        K,  # [B, L, H, D]
+        V,  # [B, L, H, D]
+        beta,  # [B, L, H, 1]
+        C,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, L, H, D = Q.size()  # [B, L, H, D]
+        num_chunks = ceil(L / C)
+        padding = num_chunks * C - L
+
+        if padding > 0:
+            pad_size = (0, 0, 0, 0, 0, padding)
+            Q = F.pad(Q, pad_size)
+            K = F.pad(K, pad_size)
+            V = F.pad(V, pad_size)
+            beta = F.pad(beta, pad_size)
+
+        Q, K, V = map(
+            lambda x: x.view(B, num_chunks, C, H, D), (Q, K, V)
+        )  # [B, L, H, D] --> [B, num_chunks, C, H, D]
+        beta = beta.view(
+            B, num_chunks, C, H, 1
+        )  # [B, L, H, 1] --> [B, num_chunks, C, H, 1]
+
+        K_beta = K * beta  # [B, num_chunks, C, H, D]
+        V_beta = V * beta  # [B, num_chunks, C, H, D]
+
+        K_beta_reshaped = K_beta.transpose(3, 4)  # [B, num_chunks, C, D, H]
+        K_transposed = K.transpose(3, 4)  # [B, num_chunks, C, D, H]
+
+        T = torch.zeros(B, num_chunks, C, C, device=Q.device)
+        for h in range(H):
+            T -= (
+                K_beta_reshaped[..., h] @ K_transposed[..., h].transpose(-1, -2)
+            ).tril(-1)
+
+        T += torch.eye(C, device=Q.device)
+
+        for i in range(1, C):
+            T[:, :, i, :i] = T[:, :, i, :i] + (
+                T[:, :, i, :, None] * T[:, :, :, :i]
+            ).sum(-2)
+
+        W = torch.zeros_like(K_beta)  # [B, num_chunks, C, H, D]
+        U = torch.zeros_like(V_beta)  # [B, num_chunks, C, H, D]
+
+        for h in range(H):
+            # T: [B, num_chunks, C, C]
+            # K_beta[..., h, :]: [B, num_chunks, C, D]
+            W[..., h, :] = T @ K_beta[..., h, :]
+            U[..., h, :] = T @ V_beta[..., h, :]
+
+        O = torch.empty_like(V)
+        S = torch.zeros(B, H, D, D, device=Q.device)
+
+        for i in range(num_chunks):
+            q_i, k_i, w_i = (
+                Q[:, i],
+                K[:, i],
+                W[:, i],
+            )  # [B, C, H, D]
+
+            # Eq. 8-9 - chunkwise Delta Rule forward update
+            u_i = U[:, i] - torch.einsum("bchd,bhdd->bchd", w_i, S)  # [B, C, H, D]
+            o_inter = torch.einsum("bchd,bhdd->bchd", q_i, S)  # [B, C, H, D]
+            A_i = torch.einsum("bchd,bchd->bc", q_i, k_i).tril()  # [B, C, C]
+            o_intra = torch.einsum("bc,bchd->bchd", A_i, u_i)  # [B, C, H, D]
+            S += torch.einsum(
+                "bcdh,bche->bhde", k_i.transpose(-1, -2), u_i
+            )  # [B, H, D, D]
+            O[:, i] = o_inter + o_intra
+
+        if padding > 0:
+            O = O.reshape(B, L + padding, H, D)[:, :L]
+
+        return O.reshape(B, L, H, D), S
+
     def forward(
         self, x: torch.Tensor, last_state: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -154,17 +241,26 @@ class DeltaNet(nn.Module):
             if last_state is not None
             else torch.zeros((B, self.num_heads, head_dim, head_dim), device=x.device)
         )
-        o_t = torch.zeros((B, self.num_heads, head_dim), device=x.device)
+        o = torch.zeros((B, L, self.num_heads, head_dim), device=x.device)
 
-        for t in range(L):
-            beta_t = beta[:, t]
-            k_t = k[:, t]
-            q_t = q[:, t]
-            v_t = v[:, t]
+        if self.mode == "chunk":
+            o, last_state = self._chunk_delta_rule(q, k, v, beta, self.chunk_size)
+        else:
+            o_t = torch.zeros((B, self.num_heads, head_dim), device=x.device)
+            outputs = []
 
-            o_t, last_state = self._delta_rule(k_t, q_t, v_t, beta_t, last_state)
+            for t in range(L):
+                beta_t = beta[:, t]
+                k_t = k[:, t]
+                q_t = q[:, t]
+                v_t = v[:, t]
 
-        o = o_t.reshape(B, self.num_heads * head_dim)  # [B, H, D] --> [B, H*D]
+                o_t, last_state = self._delta_rule(k_t, q_t, v_t, beta_t, last_state)
+                outputs.append(o_t)
+
+            o = torch.stack(outputs, dim=1)  # [B, L, H, D]
+
+        o = o.reshape(B, L, self.num_heads * head_dim)  # [B, L, H, D] --> [B, L, H*D]
         o = self.output_norm(o)
         o = self.output_proj(o)
 
@@ -184,6 +280,8 @@ class DeltaNetBlock(nn.Module):
             conv_size=config.conv_size,
             conv_bias=config.conv_bias,
             norm_eps=config.norm_eps,
+            mode=config.mode,
+            chunk_size=config.chunk_size,
         )
         self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
 
@@ -204,28 +302,22 @@ class DeltaNetBlock(nn.Module):
         hidden_states: torch.Tensor,
         last_memory_state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        residual = hidden_states  # [B, L, D]
+        attn_output = self.attn_norm(hidden_states)
+        attn_output, memory_state = self.attn(
+            hidden_states, last_memory_state
+        )  # [B, L, D]
 
-        normalized = self.attn_norm(hidden_states)
-        attn_output, memory_state = self.attn(normalized, last_memory_state)  # [B, D]
+        hidden_states = hidden_states + attn_output
 
-        # Update only the last token in residual
-        updated_residual = residual.clone()
-        updated_residual[:, -1, :] = residual[:, -1, :] + attn_output
-
-        # Apply MLP only to the last token
-        last_token = updated_residual[:, -1:, :]  # [B, 1, D]
-        normalized_last = self.mlp_norm(last_token)
+        mlp_output = self.mlp_norm(hidden_states)
         gate, y = (
-            self.gate_proj(normalized_last),
-            self.up_proj(normalized_last),
+            self.gate_proj(mlp_output),
+            self.up_proj(mlp_output),
         )  # TODO: how is gate used?
-        mlp_output = self.down_proj(self.swiglu(y))  # [B, 1, D]
+        mlp_output = self.down_proj(self.swiglu(y))
+        hidden_states = hidden_states + mlp_output
 
-        final_output = updated_residual.clone()
-        final_output[:, -1:, :] = last_token + mlp_output
-
-        return final_output, memory_state
+        return hidden_states, memory_state
 
 
 class DeltaNetModel(nn.Module):
