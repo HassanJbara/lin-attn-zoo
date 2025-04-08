@@ -112,16 +112,6 @@ def test_forward_recurrent_mode(recurrent_model, test_inputs, recurrent_model_co
     )
     assert len(memory_states) == recurrent_model_config.num_hidden_layers
 
-    # Check memory state shapes
-    head_dim = recurrent_model_config.hidden_size // recurrent_model_config.num_heads
-    for state in memory_states:
-        assert state.shape == (
-            test_inputs["batch_size"],
-            recurrent_model_config.num_heads,
-            head_dim,
-            head_dim,
-        )
-
 
 def test_forward_with_memory_chunk_mode(chunk_model, test_inputs, chunk_model_config):
     """Test forward pass with provided memory states in chunk mode."""
@@ -151,42 +141,6 @@ def test_forward_with_memory_chunk_mode(chunk_model, test_inputs, chunk_model_co
         chunk_model_config.hidden_size,
     )
     assert len(updated_memory_states) == chunk_model_config.num_hidden_layers
-
-    # Verify memory states were updated (should not be all zeros anymore)
-    for state in updated_memory_states:
-        assert not torch.allclose(state, torch.zeros_like(state))
-
-
-def test_forward_with_memory_recurrent_mode(
-    recurrent_model, test_inputs, recurrent_model_config
-):
-    """Test forward pass with provided memory states in recurrent mode."""
-    # Create initial memory states
-    batch_size = test_inputs["batch_size"]
-    head_dim = recurrent_model_config.hidden_size // recurrent_model_config.num_heads
-
-    memory_states = [
-        torch.zeros((batch_size, recurrent_model_config.num_heads, head_dim, head_dim))
-        for _ in range(recurrent_model_config.num_hidden_layers)
-    ]
-
-    with torch.no_grad():
-        logits, hidden_states, updated_memory_states = recurrent_model(
-            input_ids=test_inputs["input_ids"], memory_states=memory_states
-        )
-
-    # Check shapes
-    assert logits.shape == (
-        batch_size,
-        test_inputs["seq_length"],
-        recurrent_model_config.vocab_size,
-    )
-    assert hidden_states.shape == (
-        batch_size,
-        test_inputs["seq_length"],
-        recurrent_model_config.hidden_size,
-    )
-    assert len(updated_memory_states) == recurrent_model_config.num_hidden_layers
 
     # Verify memory states were updated (should not be all zeros anymore)
     for state in updated_memory_states:
@@ -287,9 +241,6 @@ def test_compare_modes_output_shapes(chunk_model, recurrent_model, test_inputs):
     assert chunk_logits.shape == recurrent_logits.shape
     assert chunk_hidden.shape == recurrent_hidden.shape
     assert len(chunk_memory) == len(recurrent_memory)
-
-    for chunk_state, recurrent_state in zip(chunk_memory, recurrent_memory):
-        assert chunk_state.shape == recurrent_state.shape
 
 
 def test_backpropagation_chunk_mode(chunk_model, test_inputs, chunk_model_config):

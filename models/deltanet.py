@@ -133,13 +133,17 @@ class DeltaNet(nn.Module):
 
     def _chunk_delta_rule(
         self,
-        Q,  # [B, L, H, D]
-        K,  # [B, L, H, D]
-        V,  # [B, L, H, D]
+        Q,  # [B, L, H, D, 1]
+        K,  # [B, L, H, D, 1]
+        V,  # [B, L, H, D, 1]
         beta,  # [B, L, H, 1]
         C,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, L, H, D = Q.size()  # [B, L, H, D]
+        Q, K, V, beta = map(
+            lambda x: x.squeeze(-1), (Q, K, V, beta)
+        )  # [B, L, H, D, 1] --> [B, L, H, D]
+        print(f"beta shape: {beta.shape}")
+        B, L, H, D = Q.size()
         num_chunks = ceil(L / C)
         padding = num_chunks * C - L
 
@@ -264,7 +268,6 @@ class DeltaNet(nn.Module):
                     :, t : t + 1
                 ]  # [B, 1, H, 1, 1], second dimension for broadcasting
                 o_t, last_state = self._delta_rule(k_t, q_t, v_t, beta_t, last_state)
-
                 outputs.append(o_t)
 
             o = torch.cat(outputs, dim=1)  # [B, L, H, D]
@@ -303,7 +306,7 @@ class DeltaNetBlock(nn.Module):
             intermediate_size = int(config.hidden_size * hidden_ratio * 2 / 3)
             intermediate_size = 256 * ((intermediate_size + 256 - 1) // 256)
 
-        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        # self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
         self.swiglu = SwiGLU(intermediate_size, intermediate_size)
@@ -321,10 +324,11 @@ class DeltaNetBlock(nn.Module):
         hidden_states = hidden_states + attn_output
 
         mlp_output = self.mlp_norm(hidden_states)
-        gate, y = (
-            self.gate_proj(mlp_output),
-            self.up_proj(mlp_output),
-        )  # TODO: how is gate used?
+        # gate, y = (
+        #     self.gate_proj(mlp_output),
+        #     self.up_proj(mlp_output),
+        # )  # TODO: how is gate used?
+        y = self.up_proj(mlp_output)
         mlp_output = self.down_proj(self.swiglu(y))
         hidden_states = hidden_states + mlp_output
 
