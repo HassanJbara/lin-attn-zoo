@@ -69,42 +69,39 @@ class DeltaNet(nn.Module):
         self.mode = mode
         self.chunk_size = chunk_size
 
-        self.key_dim = hidden_size // num_heads
-        self.value_dim = hidden_size // num_heads
+        self.head_dim = hidden_size // num_heads
+        self.key_dim = self.num_heads * self.head_dim
+        self.value_dim = self.num_heads * self.head_dim
 
-        self.k_proj, self.q_proj, self.v_proj = (
-            nn.Linear(self.hidden_size, self.hidden_size, bias=False),
-            nn.Linear(self.hidden_size, self.hidden_size, bias=False),
-            nn.Linear(self.hidden_size, self.hidden_size, bias=False),
+        self.q_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
+
+        self.k_conv1d, self.q_conv1d, self.v_conv1d = (
+            self._build_conv(self.key_dim),
+            self._build_conv(self.key_dim),
+            self._build_conv(self.value_dim),
         )
-        self.k_conv, self.q_conv, self.v_conv = (
-            self._build_conv(),
-            self._build_conv(),
-            self._build_conv(),
-        )
-        self.kq_norm = lambda x: F.normalize(x, p=2, dim=-1)  # l2 normalization
+
+        self.kq_norm = lambda x: x / x.norm(dim=-2, keepdim=True)  # l2 normalization
         self.activation = nn.SiLU()
 
-        self.beta_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
-        self.beta_activation = nn.Sigmoid()
+        self.o_norm = nn.RMSNorm(self.head_dim, eps=self.norm_eps)
+        self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
-        self.output_norm = nn.RMSNorm(self.hidden_size, eps=self.norm_eps)
-        self.output_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-
-    def _build_conv(self):
+    def _build_conv(self, conv_dim):
         return nn.Conv1d(
-            in_channels=self.hidden_size,
-            out_channels=self.hidden_size,
+            in_channels=conv_dim,
+            out_channels=conv_dim,
             kernel_size=self.conv_size,
-            groups=self.hidden_size,
+            groups=conv_dim,
             padding=self.conv_size - 1,
             bias=self.conv_bias,
         )
 
     def _calculate_beta(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.beta_proj(x)
-        x = self.beta_activation(x)
-        return x
+        return self.b_proj(x).sigmoid()
 
     def _calculate_conv(
         self,
@@ -113,29 +110,24 @@ class DeltaNet(nn.Module):
     ):
         # reshape to apply convolution across the sequence dimension, treat features as channels
         x = x.transpose(1, 2)  # [B, L, D] --> [B, D, L]
-
-        x = conv_layer(x)[..., : x.size(-1)]
+        x = conv_layer(x)
+        x = x[..., : x.shape[-1] - (self.conv_size - 1)]
         x = self.activation(x)
-
         return x.transpose(1, 2)  # [B, D, L] --> [B, L, D]
 
     def _delta_rule(
         self,
-        k: torch.Tensor,  # [B, H, D]
-        q: torch.Tensor,  # [B, H, D]
-        v: torch.Tensor,  # [B, H, D]
-        beta: torch.Tensor,  # [B, H, 1]
-        last_state: torch.Tensor,  # [B, H, D, D]
+        k: torch.Tensor,  # [B, 1, H, D, 1]
+        q: torch.Tensor,  # [B, 1, H, D, 1]
+        v: torch.Tensor,  # [B, 1, H, D, 1]
+        beta: torch.Tensor,  # [B, 1, H, 1, 1]
+        last_state: torch.Tensor,  # [B, 1, H, D, D]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        k_unsqueezed = k.unsqueeze(-1)  # [B, H, D, 1]
-        v_unsqueezed = v.unsqueeze(-1)  # [B, H, D, 1]
-
-        update = (last_state @ k_unsqueezed - v_unsqueezed) @ k_unsqueezed.transpose(
-            -1, -2
-        )  # [B, H, D, D]
-        hidden_state = last_state - beta.unsqueeze(-1) * update
-        o = hidden_state @ q.unsqueeze(-1)  # [B, H, D, 1]
-        o = o.squeeze(-1)  # [B, H, D]
+        update = (last_state @ k - v) @ k.transpose(-1, -2)  # [B, 1, H, D, D]
+        hidden_state = last_state - beta * update
+        o = (hidden_state @ q / (self.head_dim**0.5)).squeeze(
+            -1
+        )  # [B, 1, H, D, 1] --> [B, 1, H, D]
 
         return o, hidden_state
 
@@ -220,47 +212,68 @@ class DeltaNet(nn.Module):
         self, x: torch.Tensor, last_state: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L, D = x.size()  # x: [B, L, D]
-        head_dim = self.key_dim
 
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        k = self._calculate_conv(k, self.k_conv).reshape(B, L, self.num_heads, head_dim)
-        q = self._calculate_conv(q, self.q_conv).reshape(B, L, self.num_heads, head_dim)
-        v = self._calculate_conv(v, self.v_conv).reshape(B, L, self.num_heads, head_dim)
+        k = self._calculate_conv(k, self.k_conv1d).reshape(
+            B, L, self.num_heads, self.head_dim, 1
+        )
+        q = self._calculate_conv(q, self.q_conv1d).reshape(
+            B, L, self.num_heads, self.head_dim, 1
+        )
+        v = self._calculate_conv(v, self.v_conv1d).reshape(
+            B, L, self.num_heads, self.head_dim, 1
+        )
 
-        k, q, v = self.activation(k), self.activation(q), self.activation(v)
         k, q = self.kq_norm(k), self.kq_norm(q)
 
-        beta = self._calculate_beta(x).reshape(B, L, self.num_heads, 1)
+        beta = self._calculate_beta(x).reshape(B, L, self.num_heads, 1, 1)
         last_state = (
             last_state
             if last_state is not None
-            else torch.zeros((B, self.num_heads, head_dim, head_dim), device=x.device)
+            else torch.zeros(
+                (B, 1, self.num_heads, self.head_dim, self.head_dim),
+                device=x.device,
+                requires_grad=True,
+            )
         )
-        o = torch.zeros((B, L, self.num_heads, head_dim), device=x.device)
+        o = torch.empty(
+            (B, L, self.num_heads, self.head_dim, 1),
+            requires_grad=True,
+            device=x.device,
+            dtype=x.dtype,
+        )
 
         if self.mode == "chunk":
             o, last_state = self._chunk_delta_rule(q, k, v, beta, self.chunk_size)
         else:
-            o_t = torch.zeros((B, self.num_heads, head_dim), device=x.device)
+            o_t = torch.zeros((B, self.num_heads, self.head_dim), device=x.device)
             outputs = []
 
             for t in range(L):
-                beta_t = beta[:, t]
-                k_t = k[:, t]
-                q_t = q[:, t]
-                v_t = v[:, t]
-
+                beta_t = beta[
+                    :, t : t + 1
+                ]  # [B, 1, H, 1, 1], second dimension for broadcasting
+                k_t = k[
+                    :, t : t + 1
+                ]  # [B, 1, H, 1, 1], second dimension for broadcasting
+                q_t = q[
+                    :, t : t + 1
+                ]  # [B, 1, H, 1, 1], second dimension for broadcasting
+                v_t = v[
+                    :, t : t + 1
+                ]  # [B, 1, H, 1, 1], second dimension for broadcasting
                 o_t, last_state = self._delta_rule(k_t, q_t, v_t, beta_t, last_state)
+
                 outputs.append(o_t)
 
-            o = torch.stack(outputs, dim=1)  # [B, L, H, D]
+            o = torch.cat(outputs, dim=1)  # [B, L, H, D]
 
-        o = o.reshape(B, L, self.num_heads * head_dim)  # [B, L, H, D] --> [B, L, H*D]
-        o = self.output_norm(o)
-        o = self.output_proj(o)
+        o = self.o_norm(o)
+        o = o.reshape(
+            B, L, self.num_heads * self.head_dim
+        )  # [B, L, H, D] --> [B, L, H*D]
+        o = self.o_proj(o)
 
         return o, last_state
 
