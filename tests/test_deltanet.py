@@ -1,6 +1,14 @@
 import pytest
 import torch
-from models.deltanet import DeltaNetConfig, DeltaNetModel
+from models.deltanet import DeltaNet, DeltaNetConfig, DeltaNetModel
+
+# Try to import FLA, but handle if not installed
+try:
+    from fla.layers import DeltaNet as DeltaNetFLA
+
+    FLA_AVAILABLE = True
+except ImportError:
+    FLA_AVAILABLE = False
 
 
 @pytest.fixture
@@ -287,3 +295,36 @@ def test_backpropagation_recurrent_mode(
                 f"NaN gradient for {name} in recurrent mode"
             )
     optimizer.step()
+
+
+@pytest.mark.skipif(not FLA_AVAILABLE, reason="FLA package not installed")
+@pytest.mark.parametrize("B", [1, 2])
+@pytest.mark.parametrize("T", [512])
+@pytest.mark.parametrize("H", [128])
+@pytest.mark.parametrize("mode", ["chunk", "recurrent"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_delta_net_equivalence(B: int, T: int, H: int, dtype: torch.dtype, mode: str):
+    torch.manual_seed(47)
+    x = torch.randn(B, T, H).to(dtype).requires_grad_(True)
+    n_heads = 2
+
+    model1 = DeltaNet(
+        hidden_size=H,
+        num_heads=n_heads,
+        conv_size=4,
+        norm_eps=1e-5,
+        mode=mode,
+    ).to(dtype)
+
+    model2 = DeltaNetFLA(
+        mode=f"fused_'{mode}" if mode == "recurrent" else mode,
+        d_model=H,
+        num_heads=n_heads,
+    ).to(dtype)
+
+    model2.load_state_dict(model1.state_dict())
+
+    o1, _ = model1(x)
+    o2, _, _ = model2(x, use_cache=True)
+
+    assert torch.allclose(o1, o2, atol=1e-2)
