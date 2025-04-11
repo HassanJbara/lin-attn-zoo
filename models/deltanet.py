@@ -251,7 +251,6 @@ class DeltaNet(nn.Module):
         if self.mode == "chunk":
             o, last_state = self._chunk_delta_rule(q, k, v, beta, self.chunk_size)
         else:
-            o_t = torch.zeros((B, self.num_heads, self.head_dim), device=x.device)
             outputs = []
 
             for t in range(L):

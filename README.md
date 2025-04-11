@@ -1,6 +1,6 @@
 # Linear Attention Zoo
 
-Simple, pure PyTorch implementation of popular linear attention models for demonstration and ease of use.
+Simple, pure PyTorch implementation of popular linear attention models for demonstration and ease of use. Just `pip install torch` to get started!
 
 ## Motivation
 
@@ -13,6 +13,6 @@ Simple, pure PyTorch implementation of popular linear attention models for demon
 | Model | Paper | Code | Official Implementation |
 |-------|-------|------| ---------------------|
 | DeltaNet |  | [deltanet.py](models/deltanet.py) | |
-| Gated DeltaNet | | | |
+| Gated DeltaNet | |[gated_deltanet.py](models/gated_deltanet.py) | |
 | DeltaProduct | | | |
 | Mixture of Memories | | | |
