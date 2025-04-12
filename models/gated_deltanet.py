@@ -1,12 +1,48 @@
-from __future__ import annotations
-
-import math
-from typing import Optional, Tuple
-from utils import GatedRMSNorm
+from math import log
+from typing import List, Optional, Tuple, Union
+from models.utils import GatedRMSNorm, SwiGLU
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
+
+
+class GatedDeltaNetConfig:
+    """Configuration class for GatedDeltaNet model."""
+
+    def __init__(
+        self,
+        vocab_size=10000,
+        hidden_size=128,
+        num_hidden_layers=2,
+        hidden_ratio: Optional[int] = 4,
+        intermediate_size: Optional[int] = None,
+        expand_v=2,
+        head_dim=32,
+        num_heads=3,
+        mode="recurrent",  # Note: chunk mode is not implemented in GatedDeltaNet yet
+        use_gate=True,
+        use_short_conv=True,
+        conv_size=4,
+        conv_bias=False,
+        norm_eps=1e-5,
+        pad_token_id=0,
+    ):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.hidden_ratio = hidden_ratio
+        self.intermediate_size = intermediate_size
+        self.expand_v = expand_v
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.mode = mode
+        self.use_gate = use_gate
+        self.use_short_conv = use_short_conv
+        self.conv_size = conv_size
+        self.conv_bias = conv_bias
+        self.norm_eps = norm_eps
+        self.pad_token_id = pad_token_id
 
 
 class GatedDeltaNet(nn.Module):
@@ -126,8 +162,7 @@ class GatedDeltaNet(nn.Module):
         dt_max = 0.1
         dt_init_floor = 1e-4
         dt = torch.exp(
-            torch.rand(self.num_heads) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
+            torch.rand(self.num_heads) * (log(dt_max) - log(dt_min)) + log(dt_min)
         )
         dt = torch.clamp(dt, min=dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
@@ -192,15 +227,8 @@ class GatedDeltaNet(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
         recurrent_state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if attention_mask is not None:
-            assert len(attention_mask.shape) == 2, (
-                "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
-                "for padding purposes (0 indicating padding). "
-                "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
-            )
         B, L, D = x.size()
 
         q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -244,11 +272,6 @@ class GatedDeltaNet(nn.Module):
             requires_grad=True,
         )
 
-        # dealing with padding
-        if attention_mask is not None:
-            beta = beta.mul(attention_mask[:, -beta.shape[-2] :, None])
-            g = g.mul(attention_mask[:, -g.shape[-2] :, None])
-
         if self.mode == "chunk":
             raise NotImplementedError(
                 "Chunk mode is not implemented yet. Please use recurrent mode."
@@ -282,3 +305,151 @@ class GatedDeltaNet(nn.Module):
         o = self.o_proj(o)
 
         return o, recurrent_state
+
+
+class GatedDeltaNetBlock(nn.Module):
+    def __init__(self, config: GatedDeltaNetConfig):
+        super().__init__()
+
+        self.config = config
+
+        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.attn = GatedDeltaNet(
+            hidden_size=config.hidden_size,
+            num_heads=config.num_heads,
+            conv_size=config.conv_size,
+            conv_bias=config.conv_bias,
+            norm_eps=config.norm_eps,
+            mode=config.mode,
+            use_gate=config.use_gate,
+            use_short_conv=config.use_short_conv,
+            head_dim=config.head_dim,
+            expand_v=config.expand_v,
+        )
+        self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+
+        # `intermediate_size` is chosen to be a multiple of 256 closest to `2/3 * hidden_size * hidden_ratio`
+        hidden_ratio = config.hidden_ratio if config.hidden_ratio is not None else 4
+        intermediate_size = config.intermediate_size
+        if intermediate_size is None:
+            intermediate_size = int(config.hidden_size * hidden_ratio * 2 / 3)
+            intermediate_size = 256 * ((intermediate_size + 256 - 1) // 256)
+
+        # self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+        self.swiglu = SwiGLU(intermediate_size, intermediate_size)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        last_memory_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        attn_output = self.attn_norm(hidden_states)
+        attn_output, memory_state = self.attn(
+            attn_output, last_memory_state
+        )  # [B, L, D]
+
+        hidden_states = hidden_states + attn_output
+
+        mlp_output = self.mlp_norm(hidden_states)
+        # gate, y = (
+        #     self.gate_proj(mlp_output),
+        #     self.up_proj(mlp_output),
+        # )  # TODO: how is gate used?
+        y = self.up_proj(mlp_output)
+        mlp_output = self.down_proj(self.swiglu(y))
+        hidden_states = hidden_states + mlp_output
+
+        return hidden_states, memory_state
+
+
+class GatedDeltaNetModel(nn.Module):
+    def __init__(self, config: GatedDeltaNetConfig):
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
+
+        self.embeddings = nn.Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx
+        )
+        self.layers = nn.ModuleList(
+            [GatedDeltaNetBlock(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.criterion = nn.CrossEntropyLoss()
+
+    def _process_causal_lm_output(
+        self,
+        hidden_states: torch.Tensor,
+        labels: torch.LongTensor,
+        logits_to_keep: Optional[int] = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Process outputs when the model is used as a causal language model"""
+        logits = self.lm_head(
+            hidden_states
+            if logits_to_keep is None
+            else hidden_states[:, -logits_to_keep:]
+        )
+
+        labels = labels.to(hidden_states.device)  # pyright: ignore
+        labels = torch.cat(
+            (
+                labels[..., 1:],
+                torch.full_like(labels[:, :1], self.criterion.ignore_index),
+            ),
+            1,
+        )  # pyright: ignore
+
+        loss = self.criterion(logits.view(labels.numel(), -1), labels.view(-1))
+
+        return (loss, logits, hidden_states)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        logits_to_keep: Optional[int] = 0,
+        memory_states: Optional[List[Union[torch.Tensor, None]]] = None,
+    ) -> Union[
+        Tuple[torch.Tensor, ...],
+        Tuple[torch.Tensor, torch.Tensor, List[Union[torch.Tensor, None]]],
+    ]:
+        assert not (input_ids is not None and inputs_embeds is not None), (
+            "You cannot specify both input_ids and inputs_embeds at the same time"
+        )
+        assert input_ids is not None or inputs_embeds is not None, (
+            "You have to specify either input_ids or inputs_embeds"
+        )
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embeddings(input_ids)
+        hidden_states = inputs_embeds
+
+        if memory_states is None:
+            memory_states = [None for _ in self.layers]
+
+        assert len(memory_states) == len(self.layers), (
+            f"Expected {len(self.layers)} memory states, got {len(memory_states)}"
+        )
+
+        # process through each layer with its own memory state
+        for i, layer in enumerate(self.layers):
+            hidden_states, memory_states[i] = layer(hidden_states, memory_states[i])
+
+        hidden_states = self.norm(hidden_states)
+
+        if labels is not None:
+            return self._process_causal_lm_output(hidden_states, labels, logits_to_keep)
+
+        logits = self.lm_head(
+            hidden_states
+            if logits_to_keep is None
+            else hidden_states[:, -logits_to_keep:]
+        )
+        return (logits, hidden_states, memory_states)
