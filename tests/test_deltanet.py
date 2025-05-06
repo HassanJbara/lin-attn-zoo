@@ -89,11 +89,12 @@ def test_forward_no_memory(chunk_model, test_inputs, chunk_model_config):
     )
     assert len(memory_states) == chunk_model_config.num_hidden_layers
 
-    # Check memory state shapes
+    # Check memory state shapes - updated for the new format [B, 1, H, D, D]
     head_dim = chunk_model_config.hidden_size // chunk_model_config.num_heads
     for state in memory_states:
         assert state.shape == (
             test_inputs["batch_size"],
+            1,  # New dimension for the state
             chunk_model_config.num_heads,
             head_dim,
             head_dim,
@@ -123,12 +124,20 @@ def test_forward_recurrent_mode(recurrent_model, test_inputs, recurrent_model_co
 
 def test_forward_with_memory_chunk_mode(chunk_model, test_inputs, chunk_model_config):
     """Test forward pass with provided memory states in chunk mode."""
-    # Create initial memory states
+    # Create initial memory states - updated shape to [B, 1, H, D, D]
     batch_size = test_inputs["batch_size"]
     head_dim = chunk_model_config.hidden_size // chunk_model_config.num_heads
 
     memory_states = [
-        torch.zeros((batch_size, chunk_model_config.num_heads, head_dim, head_dim))
+        torch.zeros(
+            (
+                batch_size,
+                1,  # Add dimension for state
+                chunk_model_config.num_heads,
+                head_dim,
+                head_dim,
+            )
+        )
         for _ in range(chunk_model_config.num_hidden_layers)
     ]
 
@@ -153,6 +162,14 @@ def test_forward_with_memory_chunk_mode(chunk_model, test_inputs, chunk_model_co
     # Verify memory states were updated (should not be all zeros anymore)
     for state in updated_memory_states:
         assert not torch.allclose(state, torch.zeros_like(state))
+        # Check updated shape matches expected
+        assert state.shape == (
+            batch_size,
+            1,
+            chunk_model_config.num_heads,
+            head_dim,
+            head_dim,
+        )
 
 
 def test_autoregressive_generation_chunk_mode(
