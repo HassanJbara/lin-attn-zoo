@@ -268,10 +268,37 @@ def test_compare_modes_output_shapes(chunk_model, recurrent_model, test_inputs):
     assert len(chunk_memory) == len(recurrent_memory)
 
 
+def test_compare_modes_output(chunk_model, recurrent_model, test_inputs):
+    """Test that both modes produce outputs with the same values."""
+    # copy weights from chunk model to recurrent model
+    recurrent_model.load_state_dict(chunk_model.state_dict())
+    recurrent_model.eval()
+    chunk_model.eval()
+
+    with torch.no_grad():
+        chunk_logits, chunk_hidden, chunk_memory = chunk_model(
+            input_ids=test_inputs["input_ids"]
+        )
+        recurrent_logits, recurrent_hidden, recurrent_memory = recurrent_model(
+            input_ids=test_inputs["input_ids"]
+        )
+
+    # Compare values
+    assert torch.allclose(chunk_logits, recurrent_logits, atol=1e-5)
+    assert torch.allclose(chunk_hidden, recurrent_hidden, atol=1e-5)
+
+    # Check memory states are not all zeros
+    for state in chunk_memory:
+        assert not torch.allclose(state, torch.zeros_like(state))
+    for state in recurrent_memory:
+        assert not torch.allclose(state, torch.zeros_like(state))
+
+
 def test_backpropagation_chunk_mode(chunk_model, test_inputs, chunk_model_config):
     """Test backpropagation in chunk mode."""
     # Switch to training mode
     chunk_model.train()
+    chunk_model = torch.compile(chunk_model, mode="reduce-overhead")
     optimizer = torch.optim.Adam(chunk_model.parameters(), lr=0.001)
     input_ids = test_inputs["input_ids"]
     target_ids = torch.randint(0, chunk_model_config.vocab_size, input_ids.shape)
