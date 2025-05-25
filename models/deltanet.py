@@ -190,10 +190,8 @@ class DeltaNet(nn.Module):
             S_swapped = S.swapaxes(-1, -2)
 
             O = (
-                (Q @ S_swapped + (Q @ K.swapaxes(-1, -2) * M) @ (U - W @ S_swapped))
-                .movedim(2, 1)
-                .unsqueeze(dim=-1)
-            )
+                Q @ S_swapped + (Q @ K.swapaxes(-1, -2) * M) @ (U - W @ S_swapped)
+            ).movedim(2, 1)
 
             # Handle partial chunk
             if idx == n_chunks - 1 and last_size > 0:
@@ -201,7 +199,7 @@ class DeltaNet(nn.Module):
 
             start_idx = idx * self.chunk_size
             end_idx = min((idx + 1) * self.chunk_size, L)
-            o[:, start_idx:end_idx, :, :, :] = O
+            o[:, start_idx:end_idx, :, :] = O
 
             S = S + (U - W @ S_swapped).swapaxes(-1, -2) @ K
 
@@ -230,10 +228,9 @@ class DeltaNet(nn.Module):
 
         if self.mode == "chunk":
             o = torch.empty(
-                (B, L, self.num_heads, self.head_dim, 1), device=x.device, dtype=x.dtype
+                (B, L, self.num_heads, self.head_dim), device=x.device, dtype=x.dtype
             )
             last_state = self._chunk_delta_rule(q, k, v, last_state, beta, o)
-            o = o.squeeze(-1)  # [B, L, H, D, 1] --> [B, L, H, D]
         else:
             outputs = []
             for t in range(L):
