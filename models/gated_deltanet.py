@@ -195,9 +195,7 @@ class GatedDeltaNet(nn.Module):
         return self.b_proj(x).sigmoid()
 
     def _calculate_gate(self, x: torch.Tensor) -> torch.Tensor:
-        return -self.A_log.float().exp() * F.softplus(
-            self.a_proj(x).float() + self.dt_bias
-        )
+        return -self.A_log.exp() * F.softplus(self.a_proj(x) + self.dt_bias)
 
     def _gated_delta_rule(
         self,
@@ -237,8 +235,7 @@ class GatedDeltaNet(nn.Module):
             self._calculate_conv(k, self.k_conv1d)
             .reshape(B, L, self.num_heads, self.head_k_dim)
             .transpose(1, 2)
-        )
-        # [B, H, L, D_K]
+        )  # [B, H, L, D_K]
         q = (
             self._calculate_conv(q, self.q_conv1d)
             .reshape(B, L, self.num_heads, self.head_k_dim)
@@ -260,13 +257,14 @@ class GatedDeltaNet(nn.Module):
             recurrent_state
             if recurrent_state is not None
             else torch.zeros(
-                (B, self.num_heads, self.head_dim, self.head_dim),
+                (B, self.num_heads, self.head_k_dim, self.head_v_dim),
                 device=x.device,
                 requires_grad=True,
+                dtype=x.dtype,
             )
         )
         o = torch.zeros(
-            (B, L, self.num_heads, self.head_dim),
+            (B, L, self.num_heads, self.head_v_dim),
             device=x.device,
             dtype=x.dtype,
             requires_grad=True,
@@ -295,13 +293,14 @@ class GatedDeltaNet(nn.Module):
             o = torch.stack(outputs, dim=1)  # [B, L, H, D_V]
 
         if self.use_gate:
-            g = self.g_proj(x).reshape(B, L, self.num_heads, self.head_dim)
+            g = self.g_proj(x).reshape(B, L, self.num_heads, self.head_v_dim)
             o = self.o_norm(o, g)
         else:
             o = self.o_norm(o)
+
         o = o.reshape(
-            B, L, self.num_heads * self.head_dim
-        )  # [B, L, H, D] --> [B, L, H*D]
+            B, L, self.num_heads * self.head_v_dim
+        )  # [B, L, H, D_V] --> [B, L, H*D_V]
         o = self.o_proj(o)
 
         return o, recurrent_state
