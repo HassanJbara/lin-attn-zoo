@@ -111,7 +111,6 @@ class GatedDeltaNet(nn.Module):
         assert mode in ["chunk", "recurrent"], (
             "mode must be either 'chunk' or 'recurrent'"
         )
-        print(mode)
         self.mode = mode
         self.chunk_size = chunk_size
         self.use_gate = use_gate
@@ -234,9 +233,6 @@ class GatedDeltaNet(nn.Module):
         g: torch.Tensor,  # [B, L, H, 1, 1]   (log-α)
         o: torch.Tensor,  # [B, L, H, D_V]
     ) -> torch.Tensor:
-        # print(
-        #     f"q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}, beta shape: {beta.shape}, g shape: {g.shape}, o shape: {o.shape}"
-        # )
         (B, H, L, D) = q.shape
         n_chunks = ceil(L / self.chunk_size)
         last_size = L % self.chunk_size
