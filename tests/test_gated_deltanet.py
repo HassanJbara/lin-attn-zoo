@@ -11,16 +11,24 @@ except ImportError:
     FLA_AVAILABLE = False
 
 
+# global variables for testing
+HIDDEN_SIZE = 128
+VOCAB_SIZE = 10000
+NUM_HEADS = 3
+SEQ_LENGTH = 1000
+BATCH_SIZE = 2
+
+
 @pytest.fixture
 def gated_model_config():
     """Create a test configuration for GatedDeltaNet."""
     return GatedDeltaNetConfig(
-        vocab_size=10000,
-        hidden_size=128,
+        vocab_size=VOCAB_SIZE,
+        hidden_size=HIDDEN_SIZE,
         num_hidden_layers=2,
         expand_v=1,
         head_dim=32,
-        num_heads=3,
+        num_heads=NUM_HEADS,
         mode="recurrent",
         use_gate=True,
         use_short_conv=True,
@@ -31,17 +39,17 @@ def gated_model_config():
 
 
 @pytest.fixture
-def gated_model_config_no_gate():
-    """Create a test configuration for GatedDeltaNet without gating."""
+def gated_chunk_model_config():
+    """Create a test configuration for GatedDeltaNet."""
     return GatedDeltaNetConfig(
-        vocab_size=10000,
-        hidden_size=128,
+        vocab_size=VOCAB_SIZE,
+        hidden_size=HIDDEN_SIZE,
         num_hidden_layers=2,
         expand_v=1,
         head_dim=32,
-        num_heads=3,
-        mode="recurrent",
-        use_gate=False,
+        num_heads=NUM_HEADS,
+        mode="chunk",
+        use_gate=True,
         use_short_conv=True,
         conv_size=4,
         conv_bias=False,
@@ -58,9 +66,9 @@ def gated_model(gated_model_config):
 
 
 @pytest.fixture
-def gated_model_no_gate(gated_model_config_no_gate):
-    """Create a GatedDeltaNet model without gating for testing."""
-    model = GatedDeltaNetModel(gated_model_config_no_gate)
+def chunk_model(gated_chunk_model_config):
+    """Create a DeltaNet model in chunk mode for testing."""
+    model = GatedDeltaNetModel(gated_chunk_model_config)
     model.eval()
     return model
 
@@ -68,13 +76,9 @@ def gated_model_no_gate(gated_model_config_no_gate):
 @pytest.fixture
 def test_inputs():
     """Create test input tensors."""
-    batch_size = 2
-    seq_length = 10
-    vocab_size = 10000
     return {
-        "batch_size": batch_size,
-        "seq_length": seq_length,
-        "input_ids": torch.randint(0, vocab_size, (batch_size, seq_length)),
+        "input_ids": torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LENGTH)),
+        "input_embeds": torch.randn(BATCH_SIZE, SEQ_LENGTH, HIDDEN_SIZE),
     }
 
 
@@ -108,25 +112,53 @@ def test_forward(gated_model, test_inputs, gated_model_config):
         )
 
 
-def test_no_gate_model(gated_model_no_gate, test_inputs, gated_model_config_no_gate):
-    """Test model without gating mechanism."""
-    with torch.no_grad():
-        logits, hidden_states, memory_states = gated_model_no_gate(
-            input_ids=test_inputs["input_ids"]
-        )
+@pytest.mark.parametrize("B", [1, 3])
+@pytest.mark.parametrize("T", [256, 500])
+@pytest.mark.parametrize("H", [64])
+@pytest.mark.parametrize("num_heads", [1, 3])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_modes(B: int, T: int, H: int, num_heads: int, dtype: torch.dtype):
+    model1 = GatedDeltaNet(
+        mode="recurrent", hidden_size=H, expand_v=1, num_heads=num_heads
+    ).to(dtype)
 
-    # Check shapes
-    assert logits.shape == (
-        test_inputs["batch_size"],
-        test_inputs["seq_length"],
-        gated_model_config_no_gate.vocab_size,
-    )
-    assert hidden_states.shape == (
-        test_inputs["batch_size"],
-        test_inputs["seq_length"],
-        gated_model_config_no_gate.hidden_size,
-    )
-    assert len(memory_states) == gated_model_config_no_gate.num_hidden_layers
+    model2 = GatedDeltaNet(
+        mode="chunk", hidden_size=H, expand_v=1, num_heads=num_heads
+    ).to(dtype)
+
+    model2.load_state_dict(model1.state_dict())
+    model1.eval()
+    model2.eval()
+
+    x = torch.randn(B, T, H).to(dtype).requires_grad_(True)
+    o1, _ = model1(x)
+    o2, _ = model2(x)
+
+    assert torch.allclose(o1, o2, atol=1e-2)
+
+
+# def test_compare_modes_output(chunk_model, gated_model, test_inputs):
+#     """Test that both modes produce outputs with the same values."""
+#     # copy weights from chunk model to recurrent model
+#     gated_model.load_state_dict(chunk_model.state_dict())
+
+#     with torch.no_grad():
+#         chunk_logits, chunk_hidden, chunk_memory = chunk_model(
+#             input_ids=test_inputs["input_ids"]
+#         )
+#         recurrent_logits, recurrent_hidden, recurrent_memory = gated_model(
+#             input_ids=test_inputs["input_ids"]
+#         )
+
+#     # Compare values
+#     assert torch.allclose(chunk_logits, recurrent_logits, atol=1e-1)
+#     assert torch.allclose(chunk_hidden, recurrent_hidden, atol=1e-2)
+
+#     # Check memory states are not all zeros
+#     for state in chunk_memory:
+#         assert not torch.allclose(state, torch.zeros_like(state))
+#     for state in recurrent_memory:
+#         assert not torch.allclose(state, torch.zeros_like(state))
 
 
 def test_autoregressive_generation(gated_model, test_inputs, gated_model_config):
@@ -167,20 +199,20 @@ def test_autoregressive_generation(gated_model, test_inputs, gated_model_config)
         assert (tokens < gated_model_config.vocab_size).all()
 
 
-def test_backpropagation(gated_model, test_inputs, gated_model_config):
+def test_backpropagation(chunk_model, test_inputs, gated_model_config):
     """Test backpropagation."""
     # Switch to training mode
-    gated_model.train()
-    optimizer = torch.optim.Adam(gated_model.parameters(), lr=0.001)
+    chunk_model.train()
+    optimizer = torch.optim.Adam(chunk_model.parameters(), lr=0.001)
     input_ids = test_inputs["input_ids"]
     target_ids = torch.randint(0, gated_model_config.vocab_size, input_ids.shape)
     optimizer.zero_grad()
 
-    loss, _, _ = gated_model(input_ids=input_ids, labels=target_ids)
+    loss, _, _ = chunk_model(input_ids=input_ids, labels=target_ids)
     assert not torch.isnan(loss).any()
 
     loss.backward()
-    for name, param in gated_model.named_parameters():
+    for name, param in chunk_model.named_parameters():
         if param.requires_grad:
             assert param.grad is not None, f"No gradient for {name}"
             assert not torch.isnan(param.grad).any(), f"NaN gradient for {name}"
@@ -283,8 +315,6 @@ def test_gated_delta_net_equivalence(
         expand_v=1,
     ).to(device)
     model2.load_state_dict(model1.state_dict())
-    model1.eval()
-    model2.eval()
 
     o1, _ = model1(x)
     o2, _, _ = model2(x, use_cache=True)

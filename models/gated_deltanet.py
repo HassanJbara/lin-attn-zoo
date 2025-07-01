@@ -1,4 +1,4 @@
-from math import log
+from math import log, ceil
 from typing import List, Optional, Tuple, Union
 from models.utils import GatedRMSNorm, SwiGLU
 
@@ -20,7 +20,7 @@ class GatedDeltaNetConfig:
         expand_v=2,
         head_dim=32,
         num_heads=3,
-        mode="recurrent",  # Note: chunk mode is not implemented in GatedDeltaNet yet
+        mode="recurrent",
         use_gate=True,
         use_short_conv=True,
         conv_size=4,
@@ -99,6 +99,7 @@ class GatedDeltaNet(nn.Module):
         head_dim: int = 256,
         num_heads: int = 6,
         mode: str = "chunk",
+        chunk_size: int = 64,
         use_gate: bool = True,
         use_short_conv: bool = True,
         conv_size: int = 4,
@@ -110,8 +111,9 @@ class GatedDeltaNet(nn.Module):
         assert mode in ["chunk", "recurrent"], (
             "mode must be either 'chunk' or 'recurrent'"
         )
-
+        print(mode)
         self.mode = mode
+        self.chunk_size = chunk_size
         self.use_gate = use_gate
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
@@ -206,11 +208,6 @@ class GatedDeltaNet(nn.Module):
         beta_t: torch.Tensor,  # [B, H, 1]
         recurrent_state: torch.Tensor,  # [B, H, D_K, D_V]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # L2 normalization to queries and keys
-        q_t = F.normalize(q_t, p=2, dim=-1)
-        k_t = F.normalize(k_t, p=2, dim=-1)
-
-        q_t = q_t * (k_t.shape[-1] ** -0.5)  # scale
         recurrent_state = recurrent_state * torch.exp(g_t)
 
         correction = torch.einsum("bhk,bhkv->bhv", k_t, recurrent_state)
@@ -221,6 +218,92 @@ class GatedDeltaNet(nn.Module):
         o_t = torch.einsum("bhk,bhkv->bhv", q_t, recurrent_state)
 
         return o_t, recurrent_state
+
+    def _get_chunk(self, x: torch.Tensor, idx: int) -> torch.Tensor:
+        start = idx * self.chunk_size
+        end = (idx + 1) * self.chunk_size
+        return x[:, :, start:end]
+
+    def _chunk_delta_rule(
+        self,
+        q: torch.Tensor,  # [B, L, H, D, 1]
+        k: torch.Tensor,  # [B, L, H, D, 1]
+        v: torch.Tensor,  # [B, L, H, D, 1]
+        S: torch.Tensor,  # [B, H, D, D]
+        beta: torch.Tensor,  # [B, L, H, 1, 1]
+        g: torch.Tensor,  # [B, L, H, 1, 1]   (log-α)
+        o: torch.Tensor,  # [B, L, H, D_V]
+    ) -> torch.Tensor:
+        # print(
+        #     f"q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}, beta shape: {beta.shape}, g shape: {g.shape}, o shape: {o.shape}"
+        # )
+        (B, H, L, D) = q.shape
+        n_chunks = ceil(L / self.chunk_size)
+        last_size = L % self.chunk_size
+        g = g.squeeze(dim=-1)
+
+        padding_needed = self.chunk_size - last_size if last_size > 0 else 0
+        if padding_needed > 0:
+            q, k, v, beta, g = map(
+                lambda x: F.pad(x, (0, 0, 0, padding_needed)), (q, k, v, beta, g)
+            )
+
+        I = torch.eye(self.chunk_size).repeat(B, H, 1, 1).to(q.device).type(q.dtype)
+        M, M1 = (
+            torch.tril(torch.ones((self.chunk_size, self.chunk_size)), d)
+            .repeat(B, H, 1, 1)
+            .to(q.device)
+            .type(q.dtype)
+            for d in [0, -1]
+        )
+
+        for idx in range(n_chunks):
+            Q = self._get_chunk(q, idx)
+            K = self._get_chunk(k, idx)
+            V = self._get_chunk(v, idx)
+            chunk_beta = self._get_chunk(beta, idx)
+            chunk_g = self._get_chunk(g, idx)
+
+            # ---------- cumulative log-decay → linear γ ---------- #
+            log_gamma_r = chunk_g.cumsum(dim=2).squeeze(-1)
+            gamma_r = log_gamma_r.exp()
+            log_gamma_C = log_gamma_r[..., -1:]
+            gamma_C = log_gamma_C.exp()
+            g_C_r = (log_gamma_C - log_gamma_r).exp()
+
+            # ←Q, →K, →S (per-paper decays)
+            Q_decayed = Q * gamma_r.unsqueeze(-1)
+            K_decayed = g_C_r.unsqueeze(-1) * K
+            S_decayed = S * gamma_C.unsqueeze(-1)
+
+            # Γ matrix (γ_i / γ_j) in linear space
+            Gamma = log_gamma_r.unsqueeze(-1) - log_gamma_r.unsqueeze(-2)
+            ratio = Gamma.masked_fill((1 - M1).bool(), -torch.inf).exp()
+            T = torch.linalg.solve_triangular(
+                (I + chunk_beta * ratio * (K @ K.swapaxes(-1, -2))).float(),
+                I.float(),
+                upper=False,
+            ).type(q.dtype)
+
+            W, U = T @ (chunk_beta * K), T @ (chunk_beta * V)
+            W_decayed = W * gamma_r.unsqueeze(-1)
+            S_swapped = S.swapaxes(-1, -2)
+            GM = Gamma.masked_fill((1 - M).bool(), -torch.inf).exp()
+            O = (
+                Q_decayed @ S_swapped
+                + (Q @ K.swapaxes(-1, -2) * GM) @ (U - W_decayed @ S_swapped)
+            ).movedim(2, 1)
+
+            # Handle partial chunk
+            if idx == n_chunks - 1 and last_size > 0:
+                O = O[:, :last_size]
+
+            start_idx = idx * self.chunk_size
+            end_idx = min((idx + 1) * self.chunk_size, L)
+            o[:, start_idx:end_idx, :, :] = O
+            S = S_decayed + (U - W_decayed @ S_swapped).swapaxes(-1, -2) @ K_decayed
+
+        return S
 
     def forward(
         self,
@@ -267,12 +350,17 @@ class GatedDeltaNet(nn.Module):
             (B, L, self.num_heads, self.head_v_dim),
             device=x.device,
             dtype=x.dtype,
-            requires_grad=True,
+            requires_grad=False,
         )
+        # L2 normalization to queries and keys
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
+        q = q / (self.head_dim**0.5)
 
         if self.mode == "chunk":
-            raise NotImplementedError(
-                "Chunk mode is not implemented yet. Please use recurrent mode."
+            # reshape to [B, L, H, D, 1] for chunk processing
+            recurrent_state = self._chunk_delta_rule(
+                q, k, v, recurrent_state, beta, g, o
             )
         else:
             outputs = []
