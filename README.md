@@ -12,8 +12,8 @@ Simple, pure PyTorch implementation of popular linear attention models for demon
 
 | Model | Paper | Code | Official Implementation |
 |-------|-------|------| ---------------------|
-| DeltaNet |  | [deltanet.py](models/deltanet.py) | |
-| Gated DeltaNet | |[gated_deltanet.py](models/gated_deltanet.py) | |
+| DeltaNet | [Parallelizing Linear Transformers with the Delta Rule over Sequence Length](https://arxiv.org/abs/2406.06484) | [deltanet.py](models/deltanet.py) | [DeltaNet](https://github.com/fla-org/flash-linear-attention/blob/main/fla/layers/delta_net.py) |
+| Gated DeltaNet | [Gated Delta Networks: Improving Mamba2 with Delta Rule](https://arxiv.org/abs/2412.06464) |[gated_deltanet.py](models/gated_deltanet.py) | [Gated DeltaNet](https://github.com/fla-org/flash-linear-attention/tree/main/fla/ops/gated_delta_rule) |
 | DeltaProduct | | | |
 
 ## Speed

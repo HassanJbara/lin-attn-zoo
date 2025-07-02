@@ -21,7 +21,6 @@ class GatedDeltaNetConfig:
         num_heads=3,
         mode="recurrent",
         use_gate=True,
-        use_short_conv=True,
         conv_size=4,
         conv_bias=False,
         norm_eps=1e-5,
@@ -36,7 +35,6 @@ class GatedDeltaNetConfig:
         self.num_heads = num_heads
         self.mode = mode
         self.use_gate = use_gate
-        self.use_short_conv = use_short_conv
         self.conv_size = conv_size
         self.conv_bias = conv_bias
         self.norm_eps = norm_eps
@@ -74,12 +72,10 @@ class GatedDeltaNet(nn.Module):
             Default: `chunk`.
         use_gate (bool, Optional):
             Whether to use output gate. Default: `True`.
-        use_short_conv (bool, Optional):
-            Whether to use short convolutions. Default: `True`.
         conv_size (int, Optional):
-            The kernel size of the short convolution, only used when `use_short_conv` is `True`. Default: 4.
+            The kernel size of the short convolution. Default: 4.
         conv_bias (bool, Optional):
-            Whether to use bias in the short convolution, only used when `use_short_conv` is `True`. Default: `False`.
+            Whether to use bias in the short convolution. Default: `False`.
         layer_idx (int, Optional):
             The index of the layer. Default: None.
         norm_eps (float, Optional):
@@ -94,7 +90,6 @@ class GatedDeltaNet(nn.Module):
         mode: str = "chunk",
         chunk_size: int = 64,
         use_gate: bool = True,
-        use_short_conv: bool = True,
         conv_size: int = 4,
         conv_bias: bool = False,
         layer_idx: Optional[int] = None,
@@ -108,7 +103,6 @@ class GatedDeltaNet(nn.Module):
         self.mode = mode
         self.chunk_size = chunk_size
         self.use_gate = use_gate
-        self.use_short_conv = use_short_conv
         self.conv_size = conv_size
         self.conv_bias = conv_bias
 
@@ -393,7 +387,6 @@ class GatedDeltaNetBlock(nn.Module):
             norm_eps=config.norm_eps,
             mode=config.mode,
             use_gate=config.use_gate,
-            use_short_conv=config.use_short_conv,
             head_dim=config.head_dim,
         )
         self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
