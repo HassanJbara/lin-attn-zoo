@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 
 class GatedDeltaNetConfig:
-    """Configuration class for GatedDeltaNet model."""
+    model_type = "gated_delta_net"
 
     def __init__(
         self,
@@ -17,7 +17,6 @@ class GatedDeltaNetConfig:
         num_hidden_layers=2,
         hidden_ratio: Optional[int] = 4,
         intermediate_size: Optional[int] = None,
-        expand_v=2,
         head_dim=32,
         num_heads=3,
         mode="recurrent",
@@ -33,7 +32,6 @@ class GatedDeltaNetConfig:
         self.num_hidden_layers = num_hidden_layers
         self.hidden_ratio = hidden_ratio
         self.intermediate_size = intermediate_size
-        self.expand_v = expand_v
         self.head_dim = head_dim
         self.num_heads = num_heads
         self.mode = mode
@@ -66,18 +64,14 @@ class GatedDeltaNet(nn.Module):
     Args:
         hidden_size (int, Optional):
             The hidden size of the input. Default: 2048.
-        expand_v (float, Optional):
-            The expansion ratio for the value dim. Default: 2.0.
         head_dim (int, Optional):
             The dimension of each head. Default: 256.
         num_heads (int, Optional):
             The number of heads. Default: 4.
         mode (str, Optional):
             Which Gated DeltaNet kernel to use.
-            Currently available: `chunk` and `fused_recurrent`.
+            Currently available: `chunk` and `recurrent`.
             Default: `chunk`.
-        use_beta (bool, Optional):
-            Whether to use beta. Default: `True`.
         use_gate (bool, Optional):
             Whether to use output gate. Default: `True`.
         use_short_conv (bool, Optional):
@@ -95,7 +89,6 @@ class GatedDeltaNet(nn.Module):
     def __init__(
         self,
         hidden_size: int = 2048,
-        expand_v: int = 2,
         head_dim: int = 256,
         num_heads: int = 6,
         mode: str = "chunk",
@@ -111,6 +104,7 @@ class GatedDeltaNet(nn.Module):
         assert mode in ["chunk", "recurrent"], (
             "mode must be either 'chunk' or 'recurrent'"
         )
+
         self.mode = mode
         self.chunk_size = chunk_size
         self.use_gate = use_gate
@@ -119,14 +113,13 @@ class GatedDeltaNet(nn.Module):
         self.conv_bias = conv_bias
 
         self.hidden_size = hidden_size
-        self.expand_v = expand_v
         self.head_dim = head_dim
         self.num_heads = num_heads
 
         self.key_dim = self.num_heads * self.head_dim
-        self.value_dim = self.key_dim * self.expand_v
+        self.value_dim = self.key_dim
         self.head_k_dim = head_dim
-        self.head_v_dim = head_dim * self.expand_v
+        self.head_v_dim = head_dim
         self.layer_idx = layer_idx
         self.silu = nn.SiLU()
 
@@ -225,11 +218,11 @@ class GatedDeltaNet(nn.Module):
 
     def _chunk_delta_rule(
         self,
-        q: torch.Tensor,  # [B, L, H, D, 1]
-        k: torch.Tensor,  # [B, L, H, D, 1]
-        v: torch.Tensor,  # [B, L, H, D, 1]
+        q: torch.Tensor,  # [B, L, H, D]
+        k: torch.Tensor,  # [B, L, H, D]
+        v: torch.Tensor,  # [B, L, H, D]
         S: torch.Tensor,  # [B, H, D, D]
-        beta: torch.Tensor,  # [B, L, H, 1, 1]
+        beta: torch.Tensor,  # [B, L, H, 1]
         g: torch.Tensor,  # [B, L, H, 1, 1]   (log-α)
         o: torch.Tensor,  # [B, L, H, D_V]
     ) -> torch.Tensor:
@@ -281,13 +274,12 @@ class GatedDeltaNet(nn.Module):
                 upper=False,
             ).type(q.dtype)
 
-            W, U = T @ (chunk_beta * K), T @ (chunk_beta * V)
-            W_decayed = W * gamma_r.unsqueeze(-1)
+            W, U = T @ (chunk_beta * gamma_r.unsqueeze(-1) * K), T @ (chunk_beta * V)
             S_swapped = S.swapaxes(-1, -2)
             GM = Gamma.masked_fill((1 - M).bool(), -torch.inf).exp()
             O = (
                 Q_decayed @ S_swapped
-                + (Q @ K.swapaxes(-1, -2) * GM) @ (U - W_decayed @ S_swapped)
+                + (Q @ K.swapaxes(-1, -2) * GM) @ (U - W @ S_swapped)
             ).movedim(2, 1)
 
             # Handle partial chunk
@@ -297,7 +289,7 @@ class GatedDeltaNet(nn.Module):
             start_idx = idx * self.chunk_size
             end_idx = min((idx + 1) * self.chunk_size, L)
             o[:, start_idx:end_idx, :, :] = O
-            S = S_decayed + (U - W_decayed @ S_swapped).swapaxes(-1, -2) @ K_decayed
+            S = S_decayed + (U - W @ S_swapped).swapaxes(-1, -2) @ K_decayed
 
         return S
 
@@ -338,15 +330,11 @@ class GatedDeltaNet(nn.Module):
             else torch.zeros(
                 (B, self.num_heads, self.head_k_dim, self.head_v_dim),
                 device=x.device,
-                requires_grad=True,
                 dtype=x.dtype,
             )
         )
         o = torch.zeros(
-            (B, L, self.num_heads, self.head_v_dim),
-            device=x.device,
-            dtype=x.dtype,
-            requires_grad=False,
+            (B, L, self.num_heads, self.head_v_dim), device=x.device, dtype=x.dtype
         )
         # L2 normalization to queries and keys
         q = F.normalize(q, p=2, dim=-1)
@@ -407,7 +395,6 @@ class GatedDeltaNetBlock(nn.Module):
             use_gate=config.use_gate,
             use_short_conv=config.use_short_conv,
             head_dim=config.head_dim,
-            expand_v=config.expand_v,
         )
         self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
 
