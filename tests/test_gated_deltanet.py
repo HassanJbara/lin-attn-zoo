@@ -111,6 +111,7 @@ def test_layer_backpropagation(
 
 
 @pytest.mark.skipif(not FLA_AVAILABLE, reason="FLA package not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("B", BATCH_SIZES)
 @pytest.mark.parametrize("T", SEQ_LENGTHS)
 @pytest.mark.parametrize("H", HIDDEN_SIZES)
@@ -119,8 +120,7 @@ def test_layer_backpropagation(
 def test_gated_delta_net_equivalence(
     B: int, T: int, H: int, mode: str, dtype: torch.dtype
 ):
-    torch.manual_seed(47)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     x = torch.randn(B, T, H).to(dtype).to(device).requires_grad_(True)
     n_heads = 2
 
