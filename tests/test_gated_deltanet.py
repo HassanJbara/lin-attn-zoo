@@ -7,7 +7,8 @@ try:
     from fla.layers import GatedDeltaNet as GatedDeltaNetFLA
 
     FLA_AVAILABLE = True
-except ImportError:
+except Exception as e:
+    print(f"FLA not available: {e}")
     FLA_AVAILABLE = False
 
 
