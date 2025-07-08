@@ -175,18 +175,18 @@ class DeltaNet(nn.Module):
             Q = self._get_chunk(q, idx)
             K = self._get_chunk(k, idx)
             V = self._get_chunk(v, idx)
-            chunk_beta = self._get_chunk(beta, idx).repeat(1, 1, 1, self.chunk_size) * I
+            B = self._get_chunk(beta, idx)
 
-            T = (
-                torch.linalg.solve_triangular(
-                    (I + torch.tril(chunk_beta @ K @ K.swapaxes(-1, -2), -1)).float(),
-                    I.float(),
-                    upper=False,
-                ).type(q.dtype)
-                @ chunk_beta
-            )
+            K_beta = K * B
+            V_beta = V * B
 
-            W, U = T @ K, T @ V
+            T = torch.linalg.solve_triangular(
+                (I + torch.tril(K_beta @ K.swapaxes(-1, -2), -1)).float(),
+                I.float(),
+                upper=False,
+            ).type(q.dtype)
+
+            W, U = T @ K_beta, T @ V_beta
             S_swapped = S.swapaxes(-1, -2)
 
             O = (
