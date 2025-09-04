@@ -2,12 +2,14 @@ import pytest
 import torch
 from models.deltanet import DeltaNet, DeltaNetConfig, DeltaNetModel
 
-# Try to import FLA, but handle if not installed
+# Try to import FLA and check for CUDA availability
 try:
     from fla.layers import DeltaNet as DeltaNetFLA
 
+    assert torch.cuda.is_available(), "CUDA is required for FLA tests"
     FLA_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    print(f"FLA not available: {e}")
     FLA_AVAILABLE = False
 
 
@@ -279,7 +281,7 @@ def test_delta_net_equivalence(B: int, T: int, H: int, dtype: torch.dtype, mode:
     ).to(dtype)
 
     model2 = DeltaNetFLA(
-        mode=f"fused_'{mode}" if mode == "recurrent" else mode,
+        mode=f"fused_{mode}" if mode == "recurrent" else mode,
         d_model=H,
         num_heads=n_heads,
     ).to(dtype)

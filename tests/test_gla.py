@@ -3,13 +3,14 @@ import torch
 
 from models.gla import GatedLinearAttention
 
-# Try to import FLA version
+# Try to import FLA and check for CUDA availability
 try:
     from fla.layers import GatedLinearAttention as GatedLinearAttentionFLA
 
+    assert torch.cuda.is_available(), "CUDA is required for FLA tests"
     FLA_AVAILABLE = True
-except Exception as e:
-    print(f"FLA not available for GLA: {e}")
+except ImportError as e:
+    print(f"FLA not available: {e}")
     FLA_AVAILABLE = False
 
 
