@@ -1,6 +1,8 @@
 import pytest
 import torch
 
+from models.gla import GatedLinearAttention
+
 # Try to import FLA version
 try:
     from fla.layers import GatedLinearAttention as GatedLinearAttentionFLA
