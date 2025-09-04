@@ -26,4 +26,4 @@ jobs:
 
       - name: Run tests
         run: |
-          pytest -s tests/test_gated_deltanet.py
+          pytest -s -v tests
