@@ -3,14 +3,11 @@ import torch
 
 from models.gla import GatedLinearAttention
 
-# Try to import FLA and check for CUDA availability
 try:
     from fla.layers import GatedLinearAttention as GatedLinearAttentionFLA
 
-    assert torch.cuda.is_available(), "CUDA is required for FLA tests"
     FLA_AVAILABLE = True
-except ImportError as e:
-    print(f"FLA not available: {e}")
+except ImportError:
     FLA_AVAILABLE = False
 
 
@@ -73,7 +70,8 @@ def test_gla_backpropagation(B, T, H, num_heads):
 @pytest.mark.parametrize("H", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_gla_equivalence(B, T, H, num_heads, dtype):
+@pytest.mark.parametrize("use_output_gate", [True, False])
+def test_gla_equivalence(B, T, H, num_heads, dtype, use_output_gate):
     """Compare our GLA to FLA's GatedLinearAttention in recurrent mode."""
     device = torch.device("cuda")
     x = torch.randn(B, T, H, dtype=dtype, device=device, requires_grad=True)
@@ -86,13 +84,18 @@ def test_gla_equivalence(B, T, H, num_heads, dtype):
             expand_v=1,
             expand_k=1,
             fuse_norm=False,
-            use_output_gate=False,
+            use_output_gate=use_output_gate,
         )
         .to(dtype)
         .to(device)
     )
     model2 = (
-        GatedLinearAttention(mode="recurrent", hidden_size=H, num_heads=num_heads)
+        GatedLinearAttention(
+            mode="recurrent",
+            hidden_size=H,
+            num_heads=num_heads,
+            use_output_gate=use_output_gate,
+        )
         .to(dtype)
         .to(device)
     )

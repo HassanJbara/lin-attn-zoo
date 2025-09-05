@@ -2,14 +2,11 @@ import pytest
 import torch
 from models.gated_deltanet import GatedDeltaNet, GatedDeltaNetModel, GatedDeltaNetConfig
 
-# Try to import FLA and check for CUDA availability
 try:
     from fla.layers import GatedDeltaNet as GatedDeltaNetFLA
 
-    assert torch.cuda.is_available(), "CUDA is required for FLA tests"
     FLA_AVAILABLE = True
-except ImportError as e:
-    print(f"FLA not available: {e}")
+except ImportError:
     FLA_AVAILABLE = False
 
 

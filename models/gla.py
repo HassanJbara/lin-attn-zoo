@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.utils import Swish
+
 
 class GatedLinearAttention(nn.Module):
     def __init__(
@@ -17,6 +19,7 @@ class GatedLinearAttention(nn.Module):
         gate_low_rank_dim: int = 16,
         clamp_min: Optional[float] = None,
         elementwise_affine: Optional[bool] = True,
+        use_output_gate: Optional[bool] = True,
     ) -> None:
         super().__init__()
         assert hidden_size % num_heads == 0, (
@@ -37,6 +40,7 @@ class GatedLinearAttention(nn.Module):
         self.elementwise_affine = (
             elementwise_affine if elementwise_affine is not None else True
         )
+        self.use_output_gate = use_output_gate if use_output_gate is not None else False
 
         self.head_dim = self.hidden_size // self.num_heads
         self.proj_dim = self.num_heads * self.head_dim  # Used for both key and value
@@ -50,6 +54,10 @@ class GatedLinearAttention(nn.Module):
             nn.Linear(self.gate_low_rank_dim, self.proj_dim, bias=True),
         )
 
+        if self.use_output_gate:
+            self.g_proj = nn.Linear(self.hidden_size, self.proj_dim, bias=False)
+            self.gate_fn = Swish()
+
         self.g_norm = nn.RMSNorm(
             self.head_dim,
             elementwise_affine=self.elementwise_affine,
@@ -57,9 +65,6 @@ class GatedLinearAttention(nn.Module):
         )
 
         self.o_proj = nn.Linear(self.proj_dim, self.hidden_size, bias=False)
-
-    def _l2_normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return x / x.norm(dim=-2, keepdim=True)
 
     def _gated_linear_attention(
         self,
@@ -116,6 +121,11 @@ class GatedLinearAttention(nn.Module):
 
         o = self.g_norm(o)
         o = o.reshape(B, L, self.num_heads * self.head_dim)
+
+        if self.use_output_gate:
+            g = self.g_proj(x)
+            o = o * self.gate_fn(g)
+
         o = self.o_proj(o)
 
         return o, last_state

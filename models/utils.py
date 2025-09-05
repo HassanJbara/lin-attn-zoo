@@ -65,6 +65,11 @@ class GatedRMSNorm(nn.Module):
         return x_hat * gated
 
 
+class Swish(nn.Module):
+    def forward(self, x) -> torch.Tensor:
+        return x * torch.sigmoid(x)
+
+
 class SwiGLU(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(SwiGLU, self).__init__()

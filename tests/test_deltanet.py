@@ -2,14 +2,11 @@ import pytest
 import torch
 from models.deltanet import DeltaNet, DeltaNetConfig, DeltaNetModel
 
-# Try to import FLA and check for CUDA availability
 try:
     from fla.layers import DeltaNet as DeltaNetFLA
 
-    assert torch.cuda.is_available(), "CUDA is required for FLA tests"
     FLA_AVAILABLE = True
-except ImportError as e:
-    print(f"FLA not available: {e}")
+except ImportError:
     FLA_AVAILABLE = False
 
 
@@ -262,6 +259,7 @@ def test_backpropagation_recurrent_mode(
 
 
 @pytest.mark.skipif(not FLA_AVAILABLE, reason="FLA package not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("B", [1, 2])
 @pytest.mark.parametrize("T", [512])
 @pytest.mark.parametrize("H", [128])
