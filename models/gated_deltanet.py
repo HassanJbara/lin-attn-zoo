@@ -212,12 +212,12 @@ class GatedDeltaNet(nn.Module):
 
     def _chunk_delta_rule(
         self,
-        q: torch.Tensor,  # [B, L, H, D]
-        k: torch.Tensor,  # [B, L, H, D]
-        v: torch.Tensor,  # [B, L, H, D]
+        q: torch.Tensor,  # [B, H, L, D]
+        k: torch.Tensor,  # [B, H, L, D]
+        v: torch.Tensor,  # [B, H, L, D]
         S: torch.Tensor,  # [B, H, D, D]
-        beta: torch.Tensor,  # [B, L, H, 1]
-        g: torch.Tensor,  # [B, L, H, 1, 1]   (log-α)
+        beta: torch.Tensor,  # [B, H, L, 1]
+        g: torch.Tensor,  # [B, H, L, 1, 1]   (log-α)
         o: torch.Tensor,  # [B, L, H, D_V]
     ) -> torch.Tensor:
         (B, H, L, D) = q.shape
@@ -336,7 +336,6 @@ class GatedDeltaNet(nn.Module):
         q = q / (self.head_dim**0.5)
 
         if self.mode == "chunk":
-            # reshape to [B, L, H, D, 1] for chunk processing
             recurrent_state = self._chunk_delta_rule(
                 q, k, v, recurrent_state, beta, g, o
             )
