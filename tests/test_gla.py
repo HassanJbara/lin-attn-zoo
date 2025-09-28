@@ -34,18 +34,44 @@ def test_gla_forward_shapes(B, T, H, num_heads, dtype):
     # output should be [B, T, H]
     assert o.shape == (B, T, H)
     head_dim = H // num_heads
-    # state should be [B, 1, num_heads, head_dim, head_dim]
-    assert state.shape == (B, 1, num_heads, head_dim, head_dim)
+    # state should be [B, num_heads, head_dim, head_dim]
+    assert state.shape == (B, num_heads, head_dim, head_dim)
 
 
 @pytest.mark.parametrize("B", BATCH_SIZES)
 @pytest.mark.parametrize("T", SEQ_LENGTHS)
 @pytest.mark.parametrize("H", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
-def test_gla_backpropagation(B, T, H, num_heads):
-    gla = GatedLinearAttention(mode="recurrent", hidden_size=H, num_heads=num_heads).to(
-        torch.float32
-    )
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_gla_mode_equivalence(B, T, H, num_heads, dtype):
+    """Test for numerical equivalence between recurrent and chunk modes."""
+    recurrent_model = GatedLinearAttention(
+        mode="recurrent", hidden_size=H, num_heads=num_heads
+    ).to(dtype)
+    chunk_model = GatedLinearAttention(
+        mode="chunk", hidden_size=H, num_heads=num_heads, chunk_size=16
+    ).to(dtype)
+
+    chunk_model.load_state_dict(recurrent_model.state_dict())
+    recurrent_model.eval()
+    chunk_model.eval()
+
+    x = torch.randn(B, T, H, dtype=dtype)
+    o_recurrent, _ = recurrent_model(x)
+    o_chunk, _ = chunk_model(x)
+
+    assert torch.allclose(o_recurrent, o_chunk, atol=1e-2)
+
+
+@pytest.mark.parametrize("B", BATCH_SIZES)
+@pytest.mark.parametrize("T", SEQ_LENGTHS)
+@pytest.mark.parametrize("H", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("mode", ["recurrent", "chunk"])
+def test_gla_backpropagation(B, T, H, num_heads, mode):
+    gla = GatedLinearAttention(
+        mode=mode, hidden_size=H, num_heads=num_heads, chunk_size=16
+    ).to(torch.float32)
     gla.train()
     optimizer = torch.optim.Adam(gla.parameters(), lr=1e-3)
     optimizer.zero_grad()
@@ -53,13 +79,13 @@ def test_gla_backpropagation(B, T, H, num_heads):
     x = torch.randn(B, T, H, dtype=torch.float32)
     out, state = gla(x)
     loss = out.sum()
-    assert not torch.isnan(loss), "NaN loss detected"
+    assert not torch.isnan(loss), f"NaN loss detected in {mode} mode"
 
     loss.backward()
     for name, p in gla.named_parameters():
         if p.requires_grad:
-            assert p.grad is not None, f"No grad for {name}"
-            assert not torch.isnan(p.grad).any(), f"NaN grad for {name}"
+            assert p.grad is not None, f"No grad for {name} in {mode} mode"
+            assert not torch.isnan(p.grad).any(), f"NaN grad for {name} in {mode} mode"
     optimizer.step()
 
 
@@ -71,37 +97,39 @@ def test_gla_backpropagation(B, T, H, num_heads):
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("use_output_gate", [True, False])
-def test_gla_equivalence(B, T, H, num_heads, dtype, use_output_gate):
-    """Compare our GLA to FLA's GatedLinearAttention in recurrent mode."""
+@pytest.mark.parametrize("mode", ["recurrent", "chunk"])
+def test_gla_equivalence(B, T, H, num_heads, dtype, use_output_gate, mode):
+    """Compare our GLA to FLA's GatedLinearAttention."""
     device = torch.device("cuda")
     x = torch.randn(B, T, H, dtype=dtype, device=device, requires_grad=True)
 
+    fla_mode = "fused_recurrent" if mode == "recurrent" else "fused_chunk"
+
     model1 = (
         GatedLinearAttentionFLA(
-            mode="fused_recurrent",
+            mode=fla_mode,
             hidden_size=H,
             num_heads=num_heads,
-            expand_v=1,
-            expand_k=1,
-            fuse_norm=False,
             use_output_gate=use_output_gate,
+            chunk_size=16,
         )
         .to(dtype)
         .to(device)
     )
     model2 = (
         GatedLinearAttention(
-            mode="recurrent",
+            mode=mode,
             hidden_size=H,
             num_heads=num_heads,
             use_output_gate=use_output_gate,
+            chunk_size=16,
         )
         .to(dtype)
         .to(device)
     )
     model2.load_state_dict(model1.state_dict())
 
-    o1, _, _ = model1(x)
+    o1, _ = model1(x)
     o2, _ = model2(x)
 
     assert torch.allclose(o1, o2, atol=1e-2)

@@ -30,6 +30,11 @@ class GatedRMSNorm(nn.Module):
         self.eps = eps
         self.activation = activation.lower()
 
+        if self.activation not in ["swish", "silu"]:
+            self.gate_fn = nn.Sigmoid()
+        else:
+            self.gate_fn = Swish()
+
         if use_weight:
             # Learnable scale parameter applied elementwise
             self.weight = nn.Parameter(torch.ones(*normalized_shape))
@@ -57,10 +62,7 @@ class GatedRMSNorm(nn.Module):
         if self.bias is not None:
             x_hat = x_hat + self.bias
 
-        if self.activation in ["swish", "silu"]:
-            gated = g * torch.sigmoid(g)
-        else:
-            gated = torch.sigmoid(g)
+        gated = self.gate_fn(g)
 
         return x_hat * gated
 

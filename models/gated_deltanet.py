@@ -42,58 +42,18 @@ class GatedDeltaNetConfig:
 
 
 class GatedDeltaNet(nn.Module):
-    """
-    The layer implementaion for [Gated Delta Networks: Improving Mamba2 with Delta Rule](https://arxiv.org/abs/2412.06464).
-
-    Similar to Mamba2, each layer contains around 6*hidden_size*hidden_size parameters.
-    Parameter alloation when use_gate=True:
-        - 0.75 * hidden_size * hidden_size for the q_proj and k_proj each
-        - 1.5 * hidden_size * hidden_size for the v_proj, g_proj and o_proj each
-        - Others are ignorably small.
-        - In total = 0.75 * 2 + 1.5 * 3 = 6 * hidden_size * hidden_size
-    NOTE: num_heads * head_dim = 0.75 * hidden_size, please make sure to set the correct num_heads and head_dim.
-
-    Parameter allocation when use_gate=False:
-        - 1 * hidden_size * hidden_size for the q_proj and k_proj each
-        - 2 * hidden_size * hidden_size for the v_proj and o_proj each
-        - Others are ignorably small.
-        - In total = 1 * 2 + 2 * 2 = 6 * hidden_size * hidden_size
-
-    Args:
-        hidden_size (int, Optional):
-            The hidden size of the input. Default: 2048.
-        head_dim (int, Optional):
-            The dimension of each head. Default: 256.
-        num_heads (int, Optional):
-            The number of heads. Default: 4.
-        mode (str, Optional):
-            Which Gated DeltaNet kernel to use.
-            Currently available: `chunk` and `recurrent`.
-            Default: `chunk`.
-        use_gate (bool, Optional):
-            Whether to use output gate. Default: `True`.
-        conv_size (int, Optional):
-            The kernel size of the short convolution. Default: 4.
-        conv_bias (bool, Optional):
-            Whether to use bias in the short convolution. Default: `False`.
-        layer_idx (int, Optional):
-            The index of the layer. Default: None.
-        norm_eps (float, Optional):
-            The epsilon value for the normalization layer. Default: 1e-5.
-    """
-
     def __init__(
         self,
+        mode: str = "chunk",
         hidden_size: int = 2048,
         head_dim: int = 256,
         num_heads: int = 6,
-        mode: str = "chunk",
+        norm_eps: float = 1e-5,
         chunk_size: int = 64,
         use_gate: bool = True,
         conv_size: int = 4,
         conv_bias: bool = False,
         layer_idx: Optional[int] = None,
-        norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         assert mode in ["chunk", "recurrent"], (
@@ -192,25 +152,25 @@ class GatedDeltaNet(nn.Module):
         v_t: torch.Tensor,  # [B, H, D_V]
         g_t: torch.Tensor,  # [B, H, 1, 1]
         beta_t: torch.Tensor,  # [B, H, 1]
-        recurrent_state: torch.Tensor,  # [B, H, D_K, D_V]
+        S: torch.Tensor,  # [B, H, D_K, D_V]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        recurrent_state = recurrent_state * torch.exp(g_t)
+        S = S * torch.exp(g_t)
 
-        correction = torch.einsum("bhk,bhkv->bhv", k_t, recurrent_state)
+        correction = torch.einsum("bhk,bhkv->bhv", k_t, S)
         v_t = (v_t - correction) * beta_t
 
         # Update hidden state with outer product using einsum
-        recurrent_state = recurrent_state + torch.einsum("bhk,bhv->bhkv", k_t, v_t)
-        o_t = torch.einsum("bhk,bhkv->bhv", q_t, recurrent_state)
+        S = S + torch.einsum("bhk,bhv->bhkv", k_t, v_t)
+        o_t = torch.einsum("bhk,bhkv->bhv", q_t, S)
 
-        return o_t, recurrent_state
+        return o_t, S
 
     def _get_chunk(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         start = idx * self.chunk_size
         end = (idx + 1) * self.chunk_size
         return x[:, :, start:end]
 
-    def _chunk_delta_rule(
+    def _chunk_gated_delta_rule(
         self,
         q: torch.Tensor,  # [B, H, L, D]
         k: torch.Tensor,  # [B, H, L, D]
@@ -220,7 +180,7 @@ class GatedDeltaNet(nn.Module):
         g: torch.Tensor,  # [B, H, L, 1, 1]   (log-α)
         o: torch.Tensor,  # [B, L, H, D_V]
     ) -> torch.Tensor:
-        (B, H, L, D) = q.shape
+        (B, H, L, _) = q.shape
         n_chunks = ceil(L / self.chunk_size)
         last_size = L % self.chunk_size
         g = g.squeeze(dim=-1)
@@ -290,7 +250,7 @@ class GatedDeltaNet(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        recurrent_state: Optional[torch.Tensor] = None,
+        S: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, L, D = x.size()
 
@@ -318,9 +278,9 @@ class GatedDeltaNet(nn.Module):
         g = self._calculate_gate(x).view(B, L, self.num_heads, 1, 1)  # [B, L, H, 1, 1]
         g = g.transpose(1, 2)  # [B, H, L, 1, 1]
 
-        recurrent_state = (
-            recurrent_state
-            if recurrent_state is not None
+        S = (
+            S
+            if S is not None
             else torch.zeros(
                 (B, self.num_heads, self.head_k_dim, self.head_v_dim),
                 device=x.device,
@@ -336,9 +296,7 @@ class GatedDeltaNet(nn.Module):
         q = q / (self.head_dim**0.5)
 
         if self.mode == "chunk":
-            recurrent_state = self._chunk_delta_rule(
-                q, k, v, recurrent_state, beta, g, o
-            )
+            S = self._chunk_gated_delta_rule(q, k, v, S, beta, g, o)
         else:
             outputs = []
 
@@ -350,9 +308,7 @@ class GatedDeltaNet(nn.Module):
                 g_t = g[:, :, t]  # [B, H, 1, 1]
                 beta_t = beta[:, :, t]  # [B, H, 1]
 
-                o_t, recurrent_state = self._gated_delta_rule(
-                    k_t, q_t, v_t, g_t, beta_t, recurrent_state
-                )
+                o_t, S = self._gated_delta_rule(k_t, q_t, v_t, g_t, beta_t, S)
                 outputs.append(o_t)
 
             o = torch.stack(outputs, dim=1)  # [B, L, H, D_V]
@@ -368,7 +324,7 @@ class GatedDeltaNet(nn.Module):
         )  # [B, L, H, D_V] --> [B, L, H*D_V]
         o = self.o_proj(o)
 
-        return o, recurrent_state
+        return o, S
 
 
 class GatedDeltaNetBlock(nn.Module):

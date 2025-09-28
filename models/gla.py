@@ -74,18 +74,17 @@ class GatedLinearAttention(nn.Module):
 
     def _chunk_gated_linear_attention(
         self,
-        q: torch.Tensor,  # [B, L, H, D, 1]
-        k: torch.Tensor,  # [B, L, H, D, 1]
-        v: torch.Tensor,  # [B, L, H, D_V, 1]
+        q: torch.Tensor,  # [B, L, H, D]
+        k: torch.Tensor,  # [B, L, H, D]
+        v: torch.Tensor,  # [B, L, H, D_V]
+        gk: torch.Tensor,  # [B, L, H, 1]
         S: torch.Tensor,  # [B, H, D, D_V]
-        gk: torch.Tensor,  # [B, L, H, 1, 1]
         o: torch.Tensor,  # [B, L, H, D_V]
     ) -> torch.Tensor:
-        (B, L, H, D, _) = q.shape
+        (B, L, H, D) = q.shape
         n_chunks = ceil(L / self.chunk_size)
         last_size = L % self.chunk_size if L % self.chunk_size > 0 else self.chunk_size
 
-        q, k, v, gk = map(lambda x: x.squeeze(-1), (q, k, v, gk))
         q, k, v, gk, o = map(lambda x: x.transpose(1, 2), (q, k, v, gk, o))
 
         padding_needed = self.chunk_size - last_size if last_size > 0 else 0
@@ -100,7 +99,7 @@ class GatedLinearAttention(nn.Module):
             .cumsum(3)
             .reshape(B, H, L + padding_needed, D)
         )
-        scale = q.shape[-1] ** -0.5
+        scale = self.head_dim**-0.5
 
         A_mask = torch.tril(
             torch.ones(
@@ -115,7 +114,7 @@ class GatedLinearAttention(nn.Module):
 
             # Inter-chunk part: (Q*scale)*exp(G) @ S
             qg = (Q * scale) * torch.exp(G)
-            o_inter = torch.einsum("bhlk,bhkv->bhlv", qg.float(), S.float())
+            o_inter = torch.einsum("bhlk,bhkv->bhlv", qg, S)
 
             # Intra-chunk part: A = Q_hat @ K_hat.T
             G_base = gk_cumsum[:, :, idx * self.chunk_size]
@@ -132,8 +131,8 @@ class GatedLinearAttention(nn.Module):
             S = S * torch.exp(gk_last).unsqueeze(-1)
 
             w = torch.exp(gk_last.unsqueeze(2) - G)
-            k_scaled = K * w
-            S += torch.einsum("bhlk,bhlv->bhkv", k_scaled, V)
+            K_scaled = K * w
+            S += torch.einsum("bhlk,bhlv->bhkv", K_scaled, V)
 
             # store the final output for the current chunk
             start_idx = idx * self.chunk_size
@@ -147,26 +146,30 @@ class GatedLinearAttention(nn.Module):
 
     def _gated_linear_attention(
         self,
-        k: torch.Tensor,  # Shape: [B, 1, H, D, 1]
-        q: torch.Tensor,  # Shape: [B, 1, H, D, 1]
-        v: torch.Tensor,  # Shape: [B, 1, H, D, 1]
-        S: torch.Tensor,  # Shape: [B, 1, H, D, D]
-        gk: torch.Tensor,  # Shape: [B, 1, H, D, 1]
+        k_t: torch.Tensor,  # Shape: [B, H, D]
+        q_t: torch.Tensor,  # Shape: [B, H, D]
+        v_t: torch.Tensor,  # Shape: [B, H, D]
+        gk_t: torch.Tensor,  # Shape: [B, H, D]
+        S: torch.Tensor,  # Shape: [B, H, D, D]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        update = k @ v.transpose(-1, -2)  # [B, 1, H, D, D]
-        S = torch.exp(gk) * S + update  # [B, 1, H, D, D]
-        o = (S.transpose(-1, -2) @ q / (self.head_dim**0.5)).squeeze(-1)  # [B, 1, H, D]
-        return o, S
+        update = torch.einsum("bhk,bhv->bhkv", k_t, v_t)
+
+        S = torch.exp(gk_t).unsqueeze(-1) * S + update
+
+        q_t = q_t / (self.head_dim**0.5)
+        o_t = torch.einsum("bhk,bhkv->bhv", q_t, S)
+
+        return o_t, S
 
     def forward(
         self, x: torch.Tensor, last_state: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L, _ = x.size()
 
-        q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim, 1)
-        k = self.k_proj(x).reshape(B, L, self.num_heads, self.head_dim, 1)
-        v = self.v_proj(x).reshape(B, L, self.num_heads, self.head_dim, 1)
-        gk = self.gk_proj(x).reshape(B, L, self.num_heads, self.head_dim, 1)
+        q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim)
+        k = self.k_proj(x).reshape(B, L, self.num_heads, self.head_dim)
+        v = self.v_proj(x).reshape(B, L, self.num_heads, self.head_dim)
+        gk = self.gk_proj(x).reshape(B, L, self.num_heads, self.head_dim)
 
         gk = F.logsigmoid(gk) / self.gate_logit_normalizer
 
@@ -183,20 +186,18 @@ class GatedLinearAttention(nn.Module):
         )
 
         if self.mode == "chunk":
-            last_state = self._chunk_gated_linear_attention(q, k, v, last_state, gk, o)
+            last_state = self._chunk_gated_linear_attention(q, k, v, gk, last_state, o)
         else:
-            last_state = last_state.unsqueeze(1)  # [B, 1, H, D, D]
             outputs = []
             for t in range(L):
-                t_slice = slice(t, t + 1)
                 gk_t, k_t, q_t, v_t = (
-                    gk[:, t_slice],
-                    k[:, t_slice],
-                    q[:, t_slice],
-                    v[:, t_slice],
+                    gk[:, t],
+                    k[:, t],
+                    q[:, t],
+                    v[:, t],
                 )
                 o_t, last_state = self._gated_linear_attention(
-                    k_t, q_t, v_t, last_state, gk_t
+                    k_t, q_t, v_t, gk_t, last_state
                 )
                 outputs.append(o_t)
             o = torch.cat(outputs, dim=1)  # [B, L, H, D]
