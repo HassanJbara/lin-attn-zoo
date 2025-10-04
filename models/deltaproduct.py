@@ -6,15 +6,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 from models.utils import GatedRMSNorm
 
-# from fla.ops.gated_delta_product import chunk_gated_delta_product
-# from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
-
 
 class GatedDeltaProduct(nn.Module):
-    """
-    Generalized version of GatedDoubleDeltaNet that supports arbitrary number of householder transformations.
-    """
-
     def __init__(
         self,
         hidden_size: int = 2048,
@@ -30,7 +23,7 @@ class GatedDeltaProduct(nn.Module):
         num_householder: int = 2,
     ) -> None:
         super().__init__()
-        assert mode in ["chunk", "fused_recurrent"], f"Not suppoerted mode `{mode}`."
+        assert mode in ["chunk", "recurrent"], f"Not suppoerted mode `{mode}`."
 
         self.mode = mode
         self.allow_neg_eigval = allow_neg_eigval
@@ -65,9 +58,9 @@ class GatedDeltaProduct(nn.Module):
 
         self.conv_size = conv_size
         self.k_conv1d, self.q_conv1d, self.v_conv1d = (
+            self._build_conv(self.key_dim * num_householder),
             self._build_conv(self.key_dim),
-            self._build_conv(self.key_dim),
-            self._build_conv(self.key_dim),
+            self._build_conv(self.key_dim * num_householder),
         )
 
         if use_gate:
@@ -112,15 +105,15 @@ class GatedDeltaProduct(nn.Module):
 
     def _calculate_conv(
         self,
-        x: torch.Tensor,  # [B, L, D]
+        x: torch.Tensor,  # [B, L, D * num_householder]
         conv_layer: nn.Conv1d,
     ):
         # reshape to apply convolution across the sequence dimension, treat features as channels
-        x = x.transpose(1, 2)  # [B, L, D] --> [B, D, L]
+        x = x.transpose(1, 2)
         x = conv_layer(x)
         x = x[..., : x.shape[-1] - (self.conv_size - 1)]
         x = self.silu(x)
-        return x.transpose(1, 2)  # [B, D, L] --> [B, L, D]
+        return x.transpose(1, 2)
 
     def _calculate_beta(self, x: torch.Tensor) -> torch.Tensor:
         return self.b_proj(x).sigmoid()
@@ -152,7 +145,6 @@ class GatedDeltaProduct(nn.Module):
         self,
         x: torch.Tensor,
         recurrent_state: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, L, D = x.size()
 
@@ -168,42 +160,19 @@ class GatedDeltaProduct(nn.Module):
 
         q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        k = (
-            self._calculate_conv(k, self.k_conv1d)
-            # .reshape(B, L, self.num_heads, self.head_k_dim)
-            # .transpose(1, 2)
+        k = self._calculate_conv(k, self.k_conv1d).reshape(
+            B, L * self.num_householder, self.num_heads, self.head_dim
+        )
+        q = self._calculate_conv(q, self.q_conv1d).reshape(
+            B, L, self.num_heads, self.head_dim
         )  # [B, H, L, D_K]
-        q = (
-            self._calculate_conv(q, self.q_conv1d).reshape(
-                B, L, self.num_heads, self.head_dim
-            )
-            # .transpose(1, 2)
-        )  # [B, H, L, D_K]
-        v = (
-            self._calculate_conv(v, self.v_conv1d)
-            # .reshape(B, L, self.num_heads, self.head_v_dim)
-            # .transpose(1, 2)
+        v = self._calculate_conv(v, self.v_conv1d).reshape(
+            B, L * self.num_householder, self.num_heads, self.head_dim
         )  # [B, H, L, D_V]
-
-        # k = rearrange(
-        #     k,
-        #     "... l (n h d) -> ... (l n) h d",
-        #     n=self.num_householder,
-        #     d=self.head_k_dim,
-        # )
-        k = k.reshape(B, L * self.num_householder, self.num_heads, self.head_dim)
-        # v = rearrange(
-        #     v,
-        #     "... l (n h d) -> ... (l n) h d",
-        #     n=self.num_householder,
-        #     d=self.head_v_dim,
-        # )
-        v = v.reshape(B, L * self.num_householder, self.num_heads, self.head_dim)
 
         beta = self._calculate_beta(x)
         beta = beta * 2.0 if self.allow_neg_eigval else beta
-        # beta = rearrange(beta, "... l (n h) -> ... (l n) h", n=self.num_householder)
-        beta = beta.reshape(B, L * self.num_householder, self.num_heads)
+        beta = beta.reshape(B, L * self.num_householder, self.num_heads, 1)
 
         g = self._calculate_gate(x)
         o = torch.zeros(
@@ -217,64 +186,40 @@ class GatedDeltaProduct(nn.Module):
 
         if self.mode == "chunk":
             raise NotImplementedError(
-                "Chunk mode is not implemented in this version. Use 'fused_recurrent' mode for recurrent gated delta product."
+                "Chunk mode is not implemented in this version. Use 'recurrent' mode for recurrent gated delta product."
             )
-            # o, recurrent_state = chunk_gated_delta_product(
-            #     q=q,
-            #     k=k,
-            #     v=v,
-            #     g=g,
-            #     beta=beta,
-            #     initial_state=recurrent_state,
-            #     output_final_state=use_cache,
-            #     cu_seqlens=cu_seqlens,
-            #     num_householder=self.num_householder,
-            #     use_qk_l2norm_in_kernel=True,
-            # )
 
-        elif self.mode == "fused_recurrent":
-            g_new = torch.zeros(
-                g.shape[0],
-                g.shape[1],
-                self.num_householder,
-                g.shape[2],
-                device=g.device,
-                dtype=torch.float32,
+        elif self.mode == "recurrent":
+            g_new = g.new_zeros(
+                g.shape[0], g.shape[1], self.num_householder, g.shape[2]
             )
             g_new[:, :, 0] = g
-            # g = rearrange(g_new, "... l n h -> ... (l n) h")
-            # g = g_new.reshape(g.shape[0], g.shape[1] * self.num_householder, g.shape[2])
+            g = g_new.reshape(
+                g.shape[0], g.shape[1] * self.num_householder, g.shape[2], 1, 1
+            )
 
             q_new = q.new_zeros(
                 q.shape[0], q.shape[1], self.num_householder, q.shape[2], q.shape[3]
             )
             q_new[:, :, -1] = q
-            # q = rearrange(q_new, "... l n h d-> ... (l n) h d")
             q = q_new.reshape(
                 q.shape[0], q.shape[1] * self.num_householder, q.shape[2], q.shape[3]
             )
-            # o, recurrent_state = self._gated_delta_rule(
-            #     q=q, k=k, v=v, g=g, beta=beta, initial_state=recurrent_state
-            # )
-            outputs = []
 
-            # Inside the recurrent loop
-            for t in range(L):
-                q_t = q[:, t, -1]  # [B, H, D_K]
-                k_t = k[:, t, -1]  # [B, H, D_K]
-                v_t = v[:, t, -1]  # [B, H, D_V]
-                g_t = g[:, t]  # [B, H, 1, 1]
-                beta_t = beta[:, t]  # [B, H, 1]
+            outputs = []
+            for t in range(L * self.num_householder):
+                q_t = q[:, t]
+                k_t = k[:, t]
+                v_t = v[:, t]
+                g_t = g[:, t]
+                beta_t = beta[:, t]
 
                 o_t, recurrent_state = self._gated_delta_rule(
                     k_t, q_t, v_t, g_t, beta_t, recurrent_state
                 )
                 outputs.append(o_t)
 
-            o = torch.stack(outputs, dim=1)  # [B, L, H, D_V]
-            # o = rearrange(o, "... (l n) h d -> ... l n h d", n=self.num_householder)[
-            #     ..., -1, :, :
-            # ].contiguous()
+            o = torch.stack(outputs, dim=1)  # [B, L * num_householder, H, D_V]
             o = o.reshape(
                 o.shape[0],
                 o.shape[1] // self.num_householder,
@@ -284,15 +229,12 @@ class GatedDeltaProduct(nn.Module):
             )[..., -1, :, :].contiguous()
 
         if self.use_gate:
-            # g = rearrange(self.g_proj(x), "... (h d) -> ... h d", d=self.head_dim)
             g = self.g_proj(x).reshape(B, L, self.num_heads, self.head_dim)
             o = self.o_norm(o, g)
         else:
             o = self.o_norm(o)
 
-        o = o.reshape(
-            B, L, self.num_heads * self.head_dim
-        )  # [B, L, H, D] --> [B, L, H*D]
+        o = o.reshape(B, L, self.num_heads * self.head_dim)
         o = self.o_proj(o)
 
         return o, recurrent_state

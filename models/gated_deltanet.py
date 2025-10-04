@@ -133,11 +133,11 @@ class GatedDeltaNet(nn.Module):
         conv_layer: nn.Conv1d,
     ):
         # reshape to apply convolution across the sequence dimension, treat features as channels
-        x = x.transpose(1, 2)  # [B, L, D] --> [B, D, L]
+        x = x.transpose(1, 2)
         x = conv_layer(x)
         x = x[..., : x.shape[-1] - (self.conv_size - 1)]
         x = self.silu(x)
-        return x.transpose(1, 2)  # [B, D, L] --> [B, L, D]
+        return x.transpose(1, 2)
 
     def _calculate_beta(self, x: torch.Tensor) -> torch.Tensor:
         return self.b_proj(x).sigmoid()
@@ -252,7 +252,7 @@ class GatedDeltaNet(nn.Module):
         x: torch.Tensor,
         S: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        B, L, D = x.size()
+        B, L, _ = x.size()
 
         q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
@@ -260,23 +260,23 @@ class GatedDeltaNet(nn.Module):
             self._calculate_conv(k, self.k_conv1d)
             .reshape(B, L, self.num_heads, self.head_k_dim)
             .transpose(1, 2)
-        )  # [B, H, L, D_K]
+        )
         q = (
             self._calculate_conv(q, self.q_conv1d)
             .reshape(B, L, self.num_heads, self.head_k_dim)
             .transpose(1, 2)
-        )  # [B, H, L, D_K]
+        )
         v = (
             self._calculate_conv(v, self.v_conv1d)
             .reshape(B, L, self.num_heads, self.head_v_dim)
             .transpose(1, 2)
-        )  # [B, H, L, D_V]
+        )
 
         beta = self._calculate_beta(x).unsqueeze(-1)  # [B, L, H] -> [B, L, H, 1]
-        beta = beta.transpose(1, 2)  # [B, H, L, 1]
+        beta = beta.transpose(1, 2)
 
-        g = self._calculate_gate(x).view(B, L, self.num_heads, 1, 1)  # [B, L, H, 1, 1]
-        g = g.transpose(1, 2)  # [B, H, L, 1, 1]
+        g = self._calculate_gate(x).view(B, L, self.num_heads, 1, 1)
+        g = g.transpose(1, 2)
 
         S = (
             S
@@ -319,9 +319,7 @@ class GatedDeltaNet(nn.Module):
         else:
             o = self.o_norm(o)
 
-        o = o.reshape(
-            B, L, self.num_heads * self.head_v_dim
-        )  # [B, L, H, D_V] --> [B, L, H*D_V]
+        o = o.reshape(B, L, self.num_heads * self.head_v_dim)
         o = self.o_proj(o)
 
         return o, S
