@@ -17,11 +17,12 @@ NUM_HEADS = [3]
 SEQ_LENGTHS = [256, 500]
 BATCH_SIZES = [1, 3]
 DTYPES = [torch.float16, torch.float32]
+MODES = ["chunk", "recurrent"]
 
 
 @pytest.mark.parametrize("B", BATCH_SIZES)
 @pytest.mark.parametrize("T", SEQ_LENGTHS)
-@pytest.mark.parametrize("mode", ["chunk", "recurrent"])
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_model_forward(B, T, mode, num_heads, dtype):
@@ -81,7 +82,7 @@ def test_layer_modes(B: int, T: int, H: int, num_heads: int, dtype: torch.dtype)
 @pytest.mark.parametrize("T", SEQ_LENGTHS)
 @pytest.mark.parametrize("H", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("mode", ["chunk", "recurrent"])
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize(
     "dtype", [torch.float32]
 )  # float16 is not that numerically stable
@@ -109,12 +110,33 @@ def test_layer_backpropagation(
     optimizer.step()
 
 
+@pytest.mark.parametrize("B", BATCH_SIZES)
+@pytest.mark.parametrize("T", SEQ_LENGTHS)
+@pytest.mark.parametrize("H", HIDDEN_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("mode", MODES)
+def test_causality(B, T, H, dtype, num_heads, mode):
+    """Test that the model is causal in both modes."""
+    model = GatedDeltaNet(mode=mode, hidden_size=H, num_heads=num_heads).to(dtype)
+    model.eval()
+
+    x_a = torch.randn(B, T + 10, H).to(dtype)
+    x_b = x_a.clone()
+
+    with torch.no_grad():
+        y_a, _ = model(x_a)
+        y_b, _ = model(x_b)
+
+    assert torch.allclose(y_a[:, :T], y_b[:, :T], atol=1e-5), "Causality violated"
+
+
 @pytest.mark.skipif(not FLA_AVAILABLE, reason="FLA package not installed")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("B", BATCH_SIZES)
 @pytest.mark.parametrize("T", SEQ_LENGTHS)
 @pytest.mark.parametrize("H", HIDDEN_SIZES)
-@pytest.mark.parametrize("mode", ["chunk", "recurrent"])
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_gated_delta_net_equivalence(
     B: int, T: int, H: int, mode: str, dtype: torch.dtype

@@ -17,6 +17,7 @@ SEQ_LENGTHS = [16, 32]
 HIDDEN_SIZES = [64]
 NUM_HEADS = [4]
 DTYPES = [torch.float32, torch.float16]
+MODES = ["recurrent", "chunk"]
 
 
 @pytest.mark.parametrize("B", BATCH_SIZES)
@@ -24,10 +25,9 @@ DTYPES = [torch.float32, torch.float16]
 @pytest.mark.parametrize("H", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_gla_forward_shapes(B, T, H, num_heads, dtype):
-    gla = GatedLinearAttention(mode="recurrent", hidden_size=H, num_heads=num_heads).to(
-        dtype
-    )
+@pytest.mark.parametrize("mode", MODES)
+def test_gla_forward_shapes(B, T, H, num_heads, dtype, mode):
+    gla = GatedLinearAttention(mode=mode, hidden_size=H, num_heads=num_heads).to(dtype)
     x = torch.randn(B, T, H, dtype=dtype)
     o, state = gla(x)
 
@@ -67,7 +67,7 @@ def test_gla_mode_equivalence(B, T, H, num_heads, dtype):
 @pytest.mark.parametrize("T", SEQ_LENGTHS)
 @pytest.mark.parametrize("H", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("mode", ["recurrent", "chunk"])
+@pytest.mark.parametrize("mode", MODES)
 def test_gla_backpropagation(B, T, H, num_heads, mode):
     gla = GatedLinearAttention(
         mode=mode, hidden_size=H, num_heads=num_heads, chunk_size=16
@@ -89,6 +89,30 @@ def test_gla_backpropagation(B, T, H, num_heads, mode):
     optimizer.step()
 
 
+@pytest.mark.parametrize("B", BATCH_SIZES)
+@pytest.mark.parametrize("T", SEQ_LENGTHS)
+@pytest.mark.parametrize("H", HIDDEN_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("mode", MODES)
+def test_causality(B, T, H, dtype, num_heads, mode):
+    """Test that the model maintains causality in its outputs."""
+    model = GatedLinearAttention(mode=mode, hidden_size=H, num_heads=num_heads).to(
+        dtype
+    )
+    model.eval()
+
+    x_a = torch.randn(B, T, H, dtype=dtype)
+    x_b = x_a.clone()
+    x_b[:, T:] = torch.randn(B, T - T, H, dtype=dtype)  # different future
+
+    with torch.no_grad():
+        y_a, _ = model(x_a)
+        y_b, _ = model(x_b)
+
+    assert torch.allclose(y_a[:, :T], y_b[:, :T], atol=1e-5), "Causality violated"
+
+
 @pytest.mark.skipif(not FLA_AVAILABLE, reason="FLA package not installed")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("B", BATCH_SIZES)
@@ -97,7 +121,7 @@ def test_gla_backpropagation(B, T, H, num_heads, mode):
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("use_output_gate", [True, False])
-@pytest.mark.parametrize("mode", ["recurrent", "chunk"])
+@pytest.mark.parametrize("mode", MODES)
 def test_gla_equivalence(B, T, H, num_heads, dtype, use_output_gate, mode):
     """Compare our GLA to FLA's GatedLinearAttention."""
     device = torch.device("cuda")
