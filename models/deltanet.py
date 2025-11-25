@@ -1,10 +1,30 @@
-from math import ceil
+from math import ceil, sqrt
 from typing import List, Optional, Tuple, Union
-from models.utils import SwiGLU
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# only if transformers is installed
+try:
+    from transformers.modeling_utils import PreTrainedModel
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+except ImportError:
+    PreTrainedModel = nn.Module
+
+    class CausalLMOutputWithPast:
+        def __init__(
+            self,
+            loss=None,
+            logits=None,
+            past_key_values=None,
+            hidden_states=None,
+            **kwargs,
+        ):
+            self.loss = loss
+            self.logits = logits
+            self.past_key_values = past_key_values
+            self.hidden_states = hidden_states
 
 
 class DeltaNetConfig:
@@ -277,10 +297,19 @@ class DeltaNetBlock(nn.Module):
             intermediate_size = int(config.hidden_size * hidden_ratio * 2 / 3)
             intermediate_size = 256 * ((intermediate_size + 256 - 1) // 256)
 
-        # self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
-        self.swiglu = SwiGLU(intermediate_size, intermediate_size)
+        # Create MLP submodule to match FLA structure
+        self.mlp = nn.ModuleDict(
+            {
+                "gate_proj": nn.Linear(
+                    config.hidden_size, intermediate_size, bias=False
+                ),
+                "up_proj": nn.Linear(config.hidden_size, intermediate_size, bias=False),
+                "down_proj": nn.Linear(
+                    intermediate_size, config.hidden_size, bias=False
+                ),
+            }
+        )
+        self.activation = nn.SiLU()
 
     def forward(
         self,
@@ -295,20 +324,76 @@ class DeltaNetBlock(nn.Module):
         hidden_states = hidden_states + attn_output
 
         mlp_output = self.mlp_norm(hidden_states)
-        # gate, y = (
-        #     self.gate_proj(mlp_output),
-        #     self.up_proj(mlp_output),
-        # )  # TODO: how is gate used?
-        y = self.up_proj(mlp_output)
-        mlp_output = self.down_proj(self.swiglu(y))
+        # SwiGLU: gate_proj(x) * silu(up_proj(x))
+        gate = self.activation(self.mlp["gate_proj"](mlp_output))
+        up = self.mlp["up_proj"](mlp_output)
+        mlp_output = self.mlp["down_proj"](gate * up)
         hidden_states = hidden_states + mlp_output
 
         return hidden_states, memory_state
 
 
-class DeltaNetModel(nn.Module):
-    def __init__(self, config: DeltaNetConfig, device=None):
-        super().__init__()
+class DeltaNetPreTrainedModel(PreTrainedModel):  # type: ignore
+    config_class = DeltaNetConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["DeltaNetBlock"]
+    _supports_cache_class = True
+
+    def __init__(self, *inputs, **kwargs):
+        super().__init__(*inputs, **kwargs)
+
+    def _init_weights(
+        self,
+        module: nn.Module,
+        prenorm_residual_strategy: str | None = None,
+        num_residuals_per_layer: int = 2,
+    ):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+        elif hasattr(module, "reset_parameters"):
+            module.reset_parameters()
+
+        if prenorm_residual_strategy is not None:
+            # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
+            #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
+            #   > the weights of residual layers at initialization by a factor of 1/√N where N is the # of residual layers.
+            #   >   -- GPT-2 :: https://openai.com/blog/better-language-models/
+            #
+            # Reference (Megatron-LM): https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/gpt_model.py
+            p = None
+            if hasattr(module, "o_proj"):
+                p = module.o_proj.weight
+            elif hasattr(module, "down_proj"):
+                p = module.down_proj.weight
+            if p is not None:
+                # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
+                # Following Pytorch init, except scale by 1/sqrt(2 * n_layer)
+                # We need to reinit p since this code could be called multiple times
+                # Having just p *= scale would repeatedly scale it down
+                if prenorm_residual_strategy == "rescale":
+                    nn.init.kaiming_uniform_(p, a=sqrt(5))
+                    with torch.no_grad():
+                        p /= sqrt(
+                            num_residuals_per_layer * self.config.num_hidden_layers
+                        )
+                elif prenorm_residual_strategy == "zero":
+                    nn.init.zeros_(p)
+                else:
+                    raise ValueError(
+                        f"Invalid prenorm_residual_strategy: {prenorm_residual_strategy}"
+                    )
+
+
+class DeltaNetModel(DeltaNetPreTrainedModel):
+    def __init__(self, config: DeltaNetConfig):
+        super().__init__(config)
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -321,50 +406,15 @@ class DeltaNetModel(nn.Module):
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
 
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.criterion = nn.CrossEntropyLoss()
-
-        if device is not None:
-            self.device = device
-            self.to(device)
-
-    def _process_causal_lm_output(
-        self,
-        hidden_states: torch.Tensor,
-        labels: torch.LongTensor,
-        logits_to_keep: Optional[int] = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Process outputs when the model is used as a causal language model"""
-        logits = self.lm_head(
-            hidden_states
-            if logits_to_keep is None
-            else hidden_states[:, -logits_to_keep:]
-        )
-
-        labels = labels.to(hidden_states.device)  # pyright: ignore
-        labels = torch.cat(
-            (
-                labels[..., 1:],
-                torch.full_like(labels[:, :1], self.criterion.ignore_index),
-            ),
-            1,
-        )  # pyright: ignore
-
-        loss = self.criterion(logits.view(labels.numel(), -1), labels.view(-1))
-
-        return (loss, logits, hidden_states)
+        self.gradient_checkpointing = False
+        self.post_init()
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        logits_to_keep: Optional[int] = 0,
         memory_states: Optional[List[Union[torch.Tensor, None]]] = None,
-    ) -> Union[
-        Tuple[torch.Tensor, ...],
-        Tuple[torch.Tensor, torch.Tensor, List[Union[torch.Tensor, None]]],
-    ]:
+    ) -> Tuple[torch.Tensor, List[Union[torch.Tensor, None]]]:
         assert not (input_ids is not None and inputs_embeds is not None), (
             "You cannot specify both input_ids and inputs_embeds at the same time"
         )
@@ -389,12 +439,72 @@ class DeltaNetModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
-        if labels is not None:
-            return self._process_causal_lm_output(hidden_states, labels, logits_to_keep)
+        return (hidden_states, memory_states)
+
+
+class DeltaNetForCausalLM(DeltaNetPreTrainedModel):
+    def __init__(self, config: DeltaNetConfig):
+        super().__init__(config)
+
+        self.model = DeltaNetModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.criterion = nn.CrossEntropyLoss()
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        logits_to_keep: Optional[int] = 0,
+        memory_states: Optional[List[Union[torch.Tensor, None]]] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        return_dict = (
+            return_dict
+            if return_dict is not None
+            else self.config.use_return_dict
+            if hasattr(self.config, "use_return_dict")
+            else True
+        )
+
+        hidden_states, memory_states = self.model(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            memory_states=memory_states,
+        )
 
         logits = self.lm_head(
             hidden_states
             if logits_to_keep is None
             else hidden_states[:, -logits_to_keep:]
         )
-        return (logits, hidden_states, memory_states)
+
+        loss = None
+        if labels is not None:
+            labels = labels.to(hidden_states.device)
+            labels = torch.cat(
+                (
+                    labels[..., 1:],
+                    torch.full_like(labels[:, :1], self.criterion.ignore_index),
+                ),
+                1,
+            )
+            loss = self.criterion(
+                logits.view(labels.numel(), -1).float(), labels.view(-1)
+            )
+
+        if not return_dict:
+            output = (logits, hidden_states, memory_states)
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=memory_states,
+            hidden_states=hidden_states,
+        )
