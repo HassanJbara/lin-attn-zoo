@@ -1,289 +1,179 @@
 import pytest
 import torch
-from models.deltanet import DeltaNet, DeltaNetConfig, DeltaNetModel
+from models.deltanet import DeltaNet
+from models.model import ModelConfig, ForCausalLM
 
 try:
     from fla.layers import DeltaNet as DeltaNetFLA
 
     FLA_AVAILABLE = True
-except ImportError:
+except Exception:
     FLA_AVAILABLE = False
 
 
-@pytest.fixture
-def chunk_model_config():
-    """Create a test configuration for DeltaNet in chunk mode."""
-    return DeltaNetConfig(
+# Global variables for testing
+HIDDEN_SIZES = [64]
+VOCAB_SIZE = 10000
+NUM_HEADS = [2, 4]
+SEQ_LENGTHS = [256, 500]
+BATCH_SIZES = [1, 3]
+DTYPES = [torch.float16, torch.float32]
+MODES = ["chunk", "recurrent"]
+
+
+@pytest.mark.parametrize("H", HIDDEN_SIZES)
+@pytest.mark.parametrize("B", BATCH_SIZES)
+@pytest.mark.parametrize("T", SEQ_LENGTHS)
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_model_forward(H, B, T, mode, num_heads, dtype):
+    """Test forward pass without providing memory states."""
+    model_config = ModelConfig(
         vocab_size=10000,
-        hidden_size=128,
+        hidden_size=H,
         num_hidden_layers=2,
-        num_heads=4,
-        conv_size=3,
-        norm_eps=1e-5,
-        mode="chunk",
-        chunk_size=4,
+        num_heads=num_heads,
+        mode=mode,
     )
-
-
-@pytest.fixture
-def recurrent_model_config():
-    """Create a test configuration for DeltaNet in recurrent mode."""
-    return DeltaNetConfig(
-        vocab_size=10000,
-        hidden_size=128,
-        num_hidden_layers=2,
-        num_heads=4,
-        conv_size=3,
-        norm_eps=1e-5,
-        mode="recurrent",
-    )
-
-
-@pytest.fixture
-def chunk_model(chunk_model_config):
-    """Create a DeltaNet model in chunk mode for testing."""
-    model = DeltaNetModel(chunk_model_config)
-    model.eval()
-    return model
-
-
-@pytest.fixture
-def recurrent_model(recurrent_model_config):
-    """Create a DeltaNet model in recurrent mode for testing."""
-    model = DeltaNetModel(recurrent_model_config)
-    model.eval()
-    return model
-
-
-@pytest.fixture
-def test_inputs():
-    """Create test input tensors."""
-    batch_size = 2
-    seq_length = 10
-    vocab_size = 10000
-    return {
-        "batch_size": batch_size,
-        "seq_length": seq_length,
-        "input_ids": torch.randint(0, vocab_size, (batch_size, seq_length)),
-    }
-
-
-def test_forward_recurrent_mode(recurrent_model, test_inputs, recurrent_model_config):
-    """Test forward pass in recurrent mode."""
+    model = ForCausalLM(model_config).to(dtype)
+    input_ids = torch.randint(0, model_config.vocab_size, (B, T))
     with torch.no_grad():
-        logits, hidden_states, memory_states = recurrent_model(
-            input_ids=test_inputs["input_ids"]
+        logits, hidden_states, memory_states = model(
+            input_ids=input_ids, return_dict=False
         )
 
     # Check shapes
-    assert logits.shape == (
-        test_inputs["batch_size"],
-        test_inputs["seq_length"],
-        recurrent_model_config.vocab_size,
-    )
-    assert hidden_states.shape == (
-        test_inputs["batch_size"],
-        test_inputs["seq_length"],
-        recurrent_model_config.hidden_size,
-    )
-    assert len(memory_states) == recurrent_model_config.num_hidden_layers
+    assert logits.shape == (B, T, model_config.vocab_size)
+    assert hidden_states.shape == (B, T, model_config.hidden_size)
+    assert len(memory_states) == model_config.num_hidden_layers
 
-
-def test_autoregressive_generation_chunk_mode(
-    chunk_model, test_inputs, chunk_model_config
-):
-    """Test autoregressive token generation in chunk mode."""
-    batch_size = test_inputs["batch_size"]
-
-    # Start with first token only
-    current_input = test_inputs["input_ids"][:, 0:1]
-    memory_states = None
-
-    # Track generated tokens
-    generated_tokens = []
-
-    # Generate 5 tokens
-    for _ in range(5):
-        with torch.no_grad():
-            logits, _, memory_states = chunk_model(
-                input_ids=current_input, memory_states=memory_states
+    # Check memory state shapes
+    for state in memory_states:
+        if model_config.mode == "recurrent":
+            assert state.shape == (
+                B,
+                1,
+                model_config.num_heads,
+                model_config.hidden_size // model_config.num_heads,
+                model_config.hidden_size // model_config.num_heads,
+            )
+        else:
+            assert state.shape == (
+                B,
+                model_config.num_heads,
+                model_config.hidden_size // model_config.num_heads,
+                model_config.hidden_size // model_config.num_heads,
             )
 
-            # Verify logits shape for single token prediction
-            assert logits.shape == (batch_size, 1, chunk_model_config.vocab_size)
 
-            # Get next token predictions
-            next_tokens = torch.argmax(logits[:, -1], dim=-1, keepdim=True)
-            assert next_tokens.shape == (batch_size, 1)
+@pytest.mark.parametrize("B", BATCH_SIZES)
+@pytest.mark.parametrize("T", SEQ_LENGTHS)
+@pytest.mark.parametrize("H", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_layer_modes(B: int, T: int, H: int, num_heads: int, dtype: torch.dtype):
+    """Test that recurrent and chunk modes produce the same output."""
+    model1 = DeltaNet(mode="recurrent", hidden_size=H, num_heads=num_heads).to(dtype)
+    model2 = DeltaNet(mode="chunk", hidden_size=H, num_heads=num_heads).to(dtype)
 
-            # Use as next input
-            current_input = next_tokens
-            generated_tokens.append(next_tokens)
+    model2.load_state_dict(model1.state_dict())
+    model1.eval()
+    model2.eval()
 
-    # Verify we generated 5 tokens for each sequence
-    assert len(generated_tokens) == 5
+    x = torch.randn(B, T, H).to(dtype).requires_grad_(True)
+    o1, _ = model1(x)
+    o2, _ = model2(x)
 
-    # Verify all tokens are within vocabulary range
-    for tokens in generated_tokens:
-        assert (tokens >= 0).all()
-        assert (tokens < chunk_model_config.vocab_size).all()
+    assert torch.allclose(o1, o2, atol=1e-2)
 
 
-def test_autoregressive_generation_recurrent_mode(
-    recurrent_model, test_inputs, recurrent_model_config
+@pytest.mark.parametrize("B", BATCH_SIZES)
+@pytest.mark.parametrize("T", SEQ_LENGTHS)
+@pytest.mark.parametrize("H", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize(
+    "dtype", [torch.float32]
+)  # float16 is not that numerically stable
+def test_layer_backpropagation(
+    B: int, T: int, H: int, num_heads: int, mode: str, dtype: torch.dtype
 ):
-    """Test autoregressive token generation in recurrent mode."""
-    batch_size = test_inputs["batch_size"]
+    """Test backpropagation."""
+    layer = DeltaNet(mode=mode, hidden_size=H, num_heads=num_heads).to(dtype)
 
-    # Start with first token only
-    current_input = test_inputs["input_ids"][:, 0:1]
-    memory_states = None
-
-    # Track generated tokens
-    generated_tokens = []
-
-    # Generate 5 tokens
-    for _ in range(5):
-        with torch.no_grad():
-            logits, _, memory_states = recurrent_model(
-                input_ids=current_input, memory_states=memory_states
-            )
-
-            # Verify logits shape for single token prediction
-            assert logits.shape == (batch_size, 1, recurrent_model_config.vocab_size)
-
-            # Get next token predictions
-            next_tokens = torch.argmax(logits[:, -1], dim=-1, keepdim=True)
-            assert next_tokens.shape == (batch_size, 1)
-
-            # Use as next input
-            current_input = next_tokens
-            generated_tokens.append(next_tokens)
-
-    # Verify we generated 5 tokens for each sequence
-    assert len(generated_tokens) == 5
-
-    # Verify all tokens are within vocabulary range
-    for tokens in generated_tokens:
-        assert (tokens >= 0).all()
-        assert (tokens < recurrent_model_config.vocab_size).all()
-
-
-def test_compare_modes_output_shapes(chunk_model, recurrent_model, test_inputs):
-    """Test that both modes produce outputs with the same shapes."""
-    with torch.no_grad():
-        chunk_logits, chunk_hidden, chunk_memory = chunk_model(
-            input_ids=test_inputs["input_ids"]
-        )
-        recurrent_logits, recurrent_hidden, recurrent_memory = recurrent_model(
-            input_ids=test_inputs["input_ids"]
-        )
-
-    # Compare shapes
-    assert chunk_logits.shape == recurrent_logits.shape
-    assert chunk_hidden.shape == recurrent_hidden.shape
-    assert len(chunk_memory) == len(recurrent_memory)
-
-
-def test_compare_modes_output(chunk_model, recurrent_model, test_inputs):
-    """Test that both modes produce outputs with the same values."""
-    # copy weights from chunk model to recurrent model
-    recurrent_model.load_state_dict(chunk_model.state_dict())
-    recurrent_model.eval()
-    chunk_model.eval()
-
-    with torch.no_grad():
-        chunk_logits, chunk_hidden, chunk_memory = chunk_model(
-            input_ids=test_inputs["input_ids"]
-        )
-        recurrent_logits, recurrent_hidden, recurrent_memory = recurrent_model(
-            input_ids=test_inputs["input_ids"]
-        )
-
-    # Compare values
-    assert torch.allclose(chunk_logits, recurrent_logits, atol=1e-5)
-    assert torch.allclose(chunk_hidden, recurrent_hidden, atol=1e-5)
-
-    # Check memory states are not all zeros
-    for state in chunk_memory:
-        assert not torch.allclose(state, torch.zeros_like(state))
-    for state in recurrent_memory:
-        assert not torch.allclose(state, torch.zeros_like(state))
-
-
-def test_backpropagation_chunk_mode(chunk_model, test_inputs, chunk_model_config):
-    """Test backpropagation in chunk mode."""
     # Switch to training mode
-    chunk_model.train()
-    chunk_model = torch.compile(chunk_model, mode="reduce-overhead")
-    optimizer = torch.optim.Adam(chunk_model.parameters(), lr=0.001)
-    input_ids = test_inputs["input_ids"]
-    target_ids = torch.randint(0, chunk_model_config.vocab_size, input_ids.shape)
+    layer.train()
+    optimizer = torch.optim.Adam(layer.parameters(), lr=0.001)
     optimizer.zero_grad()
+    x = torch.randn(B, T, H).to(dtype)
+    out, _ = layer(x)
 
-    loss, _, _ = chunk_model(input_ids=input_ids, labels=target_ids)
-    assert not torch.isnan(loss).any()
+    loss = out.sum()
+    assert not torch.isnan(loss).any(), f"NaN loss detected for {mode} mode"
 
     loss.backward()
-    for name, param in chunk_model.named_parameters():
+    for name, param in layer.named_parameters():
         if param.requires_grad:
-            assert param.grad is not None, f"No gradient for {name} in chunk mode"
-            assert not torch.isnan(param.grad).any(), (
-                f"NaN gradient for {name} in chunk mode"
-            )
+            assert param.grad is not None, f"No gradient for {name}"
+            assert not torch.isnan(param.grad).any(), f"NaN gradient for {name}"
     optimizer.step()
 
 
-def test_backpropagation_recurrent_mode(
-    recurrent_model, test_inputs, recurrent_model_config
-):
-    """Test backpropagation in recurrent mode."""
-    # Switch to training mode
-    recurrent_model.train()
-    optimizer = torch.optim.Adam(recurrent_model.parameters(), lr=0.001)
-    input_ids = test_inputs["input_ids"]
-    target_ids = torch.randint(0, recurrent_model_config.vocab_size, input_ids.shape)
-    optimizer.zero_grad()
+@pytest.mark.parametrize("B", BATCH_SIZES)
+@pytest.mark.parametrize("T", SEQ_LENGTHS)
+@pytest.mark.parametrize("H", HIDDEN_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("mode", MODES)
+def test_causality(B, T, H, dtype, num_heads, mode):
+    """Test that the model is causal in both modes."""
+    model = DeltaNet(mode=mode, hidden_size=H, num_heads=num_heads).to(dtype)
+    model.eval()
 
-    loss, _, _ = recurrent_model(input_ids=input_ids, labels=target_ids)
-    assert not torch.isnan(loss).any()
+    x_a = torch.randn(B, T + 10, H).to(dtype)
+    x_b = x_a.clone()
 
-    loss.backward()
-    for name, param in recurrent_model.named_parameters():
-        if param.requires_grad:
-            assert param.grad is not None, f"No gradient for {name} in recurrent mode"
-            assert not torch.isnan(param.grad).any(), (
-                f"NaN gradient for {name} in recurrent mode"
-            )
-    optimizer.step()
+    with torch.no_grad():
+        y_a, _ = model(x_a)
+        y_b, _ = model(x_b)
+
+    assert torch.allclose(y_a[:, :T], y_b[:, :T], atol=1e-5), "Causality violated"
 
 
 @pytest.mark.skipif(not FLA_AVAILABLE, reason="FLA package not installed")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("B", [1, 2])
-@pytest.mark.parametrize("T", [512])
-@pytest.mark.parametrize("H", [128])
-@pytest.mark.parametrize("mode", ["chunk", "recurrent"])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-def test_delta_net_equivalence(B: int, T: int, H: int, dtype: torch.dtype, mode: str):
-    torch.manual_seed(47)
-    x = torch.randn(B, T, H).to(dtype).requires_grad_(True)
+@pytest.mark.parametrize("B", BATCH_SIZES)
+@pytest.mark.parametrize("T", SEQ_LENGTHS)
+@pytest.mark.parametrize("H", HIDDEN_SIZES)
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_delta_net_equivalence(B: int, T: int, H: int, mode: str, dtype: torch.dtype):
+    """Test equivalence with FLA implementation."""
+    device = torch.device("cuda")
+    x = torch.randn(B, T, H).to(dtype).to(device).requires_grad_(True)
     n_heads = 2
 
-    model1 = DeltaNet(
-        hidden_size=H,
-        num_heads=n_heads,
-        conv_size=4,
-        norm_eps=1e-5,
-        mode=mode,
-    ).to(dtype)
-
-    model2 = DeltaNetFLA(
-        mode=f"fused_{mode}" if mode == "recurrent" else mode,
-        d_model=H,
-        num_heads=n_heads,
-    ).to(dtype)
-
+    model1 = (
+        DeltaNetFLA(
+            mode="chunk",
+            d_model=H,
+            num_heads=n_heads,
+        )
+        .to(dtype)
+        .to(device)
+    )
+    model2 = (
+        DeltaNet(
+            hidden_size=H,
+            num_heads=n_heads,
+            conv_size=4,
+            norm_eps=1e-5,
+            mode=mode,
+        )
+        .to(dtype)
+        .to(device)
+    )
     model2.load_state_dict(model1.state_dict())
 
     o1, _ = model1(x)

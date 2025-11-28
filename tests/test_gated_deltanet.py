@@ -6,7 +6,7 @@ try:
     from fla.layers import GatedDeltaNet as GatedDeltaNetFLA
 
     FLA_AVAILABLE = True
-except ImportError:
+except Exception:
     FLA_AVAILABLE = False
 
 

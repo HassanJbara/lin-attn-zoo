@@ -7,7 +7,7 @@ try:
     from fla.layers import GatedDeltaProduct as GatedDeltaProductFLA
 
     FLA_AVAILABLE = True
-except ImportError:
+except Exception:
     FLA_AVAILABLE = False
 
 

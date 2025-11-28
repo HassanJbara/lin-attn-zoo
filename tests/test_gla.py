@@ -7,7 +7,7 @@ try:
     from fla.layers import GatedLinearAttention as GatedLinearAttentionFLA
 
     FLA_AVAILABLE = True
-except ImportError:
+except Exception:
     FLA_AVAILABLE = False
 
 
