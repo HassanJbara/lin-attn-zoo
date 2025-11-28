@@ -90,3 +90,28 @@ if __name__ == "__main__":
 This yields a speedup of anything between 1.1x and 1.6x, depending on the device and model/input size. This is probably due to full graph compilation and more aggressive fusing that PyTorch can do when there are no graph breaking operations present, such as custom kernels. This obviously lacks the nice features of other implementations, such as caching, but the fact that it matches or surpasses the speed of custom kernels is surprising.
 
 More speed benchmarking to come.
+
+## Modelling Classes
+
+To create a causal language model using any of the linear attention modules, simply use the `ForCausalLM` class provided in `model.py`. For example, to create a DeltaNet-based causal language model:
+
+```python
+from models.model import ForCausalLM, ModelConfig
+
+config = ModelConfig(
+    attn_type="deltanet",
+    hidden_size=128,
+    num_heads=4,
+    hidden_ratio=4,
+    intermediate_size=None,
+    num_hidden_layers=3,
+    norm_eps=1e-6,
+    pad_token_id=None,
+    vocab_size=1000,
+    attn_kwargs={"conv_size": 4, "conv_bias": False} # deltanet specific kwargs
+)
+
+model = ForCausalLM(config)
+```
+
+This provides a simple and identical interface for all linear attention models in this repository for training, but requires the `transformers` library.
